@@ -1,0 +1,10 @@
+model:
+  name: depth-anything/Depth-Anything-V2-Small-hf
+  device: auto
+
+video:
+  # 1 processes every frame; 10 processes frames 0, 10, 20, ...
+  sample_every_n_frames: 1
+
+output:
+  directory: outputs
