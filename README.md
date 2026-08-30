@@ -1,8 +1,18 @@
-# DepthSLAM: Stage 1 Depth Anything V2 Inference
+# DepthSLAM – Monocular 3D SLAM with Depth Anything
 
-This is Stage 1 of a university project that will eventually explore monocular
-3D SLAM. **It does not implement SLAM yet.** It only estimates depth from an
-image or sampled video frames and saves reusable outputs.
+This university project will eventually explore monocular 3D SLAM using depth
+estimated from ordinary RGB images. The repository currently contains only the
+reusable depth-estimation module. **No SLAM functionality exists yet.**
+
+## Current status
+
+**Stage 1 is complete and validated.** Image inference and video inference both
+work. Video validation with `--sample-every 10` successfully processed 17
+sampled frames. The expected RGB, raw depth, visualization, comparison, and
+metadata outputs were created.
+
+This status applies only to Stage 1 depth estimation; it does not imply that a
+3D SLAM pipeline has been implemented or validated.
 
 ## Depth Anything and this project
 
@@ -15,46 +25,64 @@ The default checkpoint produces **relative depth, not metric depth**. Values are
 not distances in metres; scale and shift are ambiguous, especially across
 separate frames.
 
-This stage:
+Stage 1:
 
 - loads `depth-anything/Depth-Anything-V2-Small-hf` through Transformers, a path
   documented by the official Depth Anything V2 repository;
-- selects CUDA when available and otherwise runs on CPU;
-- accepts one image or an OpenCV-readable video;
-- samples every Nth video frame with `--sample-every`;
-- saves RGB, raw float32 relative depth, colorized depth, side-by-side previews,
-  and JSON Lines metadata.
+- accepts a single image;
+- accepts an OpenCV-readable video;
+- supports configurable video-frame sampling with `--sample-every`;
+- runs Depth Anything V2 Small relative-depth inference;
+- saves the original RGB frame;
+- saves the raw float32 relative-depth map as `.npy`;
+- saves a colorized depth visualization;
+- saves an RGB/depth side-by-side comparison;
+- writes one frame record to `metadata.jsonl`.
 
 `src/depth_estimator.py` isolates the reusable `DepthEstimator.predict(image)`
 interface for later stages. The official repository and weights are not copied.
 
 ## Setup
 
-Python 3.10 or newer is recommended. From the repository root:
+Python 3.10 or newer is recommended; the validated Windows setup used Python
+3.13.5. From the repository root on Windows:
 
 ```powershell
-python -m venv .venv
+py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+py -m pip install --upgrade pip
+py -m pip install -r requirements.txt
+py -m pip install -r requirements-dev.txt
 ```
 
-On macOS/Linux use `source .venv/bin/activate`. First inference downloads the
-checkpoint from Hugging Face; later runs use its local cache. Internet is needed
-once unless the weights are already cached.
+`requirements.txt` contains runtime dependencies. `requirements-dev.txt` adds
+the test dependency while including all runtime requirements.
+
+On macOS/Linux use `source .venv/bin/activate` and replace `py` with `python3`
+in the commands. The first inference automatically downloads the official
+`depth-anything/Depth-Anything-V2-Small-hf` checkpoint from Hugging Face; later
+runs use its local cache. Internet is needed once unless the weights are already
+cached.
+
+Hugging Face authentication is optional for this public checkpoint. Downloads
+work without an `HF_TOKEN`, although unauthenticated requests can have lower
+rate limits. On Windows, Hugging Face may warn that its cache cannot use
+symbolic links unless Developer Mode or administrator privileges are enabled.
+This warning is harmless and does not block inference; the cache may simply use
+more disk space.
 
 ## Run
 
 Image:
 
 ```powershell
-python tools/run_depth.py path/to/image.jpg --input-type image
+py tools\run_depth.py data\test.jpg --input-type image
 ```
 
 Video, processing frames 0, 10, 20, and so on:
 
 ```powershell
-python tools/run_depth.py path/to/video.mp4 --input-type video --sample-every 10
+py tools\run_depth.py data\test.mp4 --input-type video --sample-every 10
 ```
 
 Common extensions are auto-detected if `--input-type` is omitted. Options include
@@ -64,8 +92,25 @@ and `--model <hugging-face-model-id>`.
 Run lightweight tests without model weights:
 
 ```powershell
-python -m unittest discover -s tests
+py -m pytest
 ```
+
+### CPU and CUDA behavior
+
+With the default `device: auto`, the estimator uses CUDA when PyTorch reports an
+available CUDA device and otherwise uses CPU. `--device cpu` forces CPU, while
+`--device cuda` requests CUDA and returns a clear error if CUDA is unavailable.
+Stage 1 was validated on CPU only; **CUDA has not been tested**.
+
+## Validated Environment
+
+- Operating system: Windows
+- Python: 3.13.5
+- Inference device: CPU
+- Tests: 5 pytest tests passed
+- Image inference: passed
+- Video inference: passed, including 17 frames sampled with `--sample-every 10`
+- CLI help: passed
 
 ## Outputs
 
@@ -73,11 +118,11 @@ Each run creates a timestamped directory without overwriting earlier results:
 
 ```text
 outputs/<source-name>_<timestamp>/
-├── rgb/
-├── depth_raw/      # float32 relative-depth .npy files
-├── depth_vis/      # per-frame normalized color images
-├── side_by_side/   # original and depth visualization
-└── metadata.jsonl  # one record per processed frame
+|-- rgb/
+|-- depth_raw/      # float32 relative-depth .npy files
+|-- depth_vis/      # per-frame normalized color images
+|-- side_by_side/   # original and depth visualization
+`-- metadata.jsonl  # one record per processed frame
 ```
 
 Metadata contains source path, source frame index, video timestamp, width,
@@ -93,8 +138,8 @@ frames; `10` processes every tenth frame.
 
 - Depth is relative and uncalibrated, not metric.
 - Video frames are inferred independently with no temporal consistency step.
-- There is no camera calibration/motion, feature matching, map fusion,
-  point-cloud construction, GUI, or evaluation.
+- There is no SLAM, visual odometry, feature matching, camera motion estimation,
+  map fusion, keyframe handling, loop closure, GUI, or evaluation.
 - CPU inference is supported but can be slow.
 - Transformers output can differ slightly from the original repository's
   OpenCV preprocessing/upsampling path, as the official authors note.
