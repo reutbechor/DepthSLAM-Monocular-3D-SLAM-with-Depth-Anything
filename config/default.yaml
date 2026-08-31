@@ -6,5 +6,21 @@ video:
   # 1 processes every frame; 10 processes frames 0, 10, 20, ...
   sample_every_n_frames: 1
 
+camera:
+  # Supply calibrated pixel intrinsics here or through run_motion.py arguments.
+  fx: null
+  fy: null
+  cx: null
+  cy: null
+
+motion:
+  ratio_threshold: 0.75
+  max_features: null
+  minimum_matches: 8
+  ransac_probability: 0.999
+  ransac_threshold_pixels: 1.0
+  minimum_inliers: 8
+  minimum_inlier_ratio: 0.25
+
 output:
   directory: outputs

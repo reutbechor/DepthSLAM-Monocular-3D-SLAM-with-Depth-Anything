@@ -1,8 +1,9 @@
 # DepthSLAM – Monocular 3D SLAM with Depth Anything
 
 This university project will eventually explore monocular 3D SLAM using depth
-estimated from ordinary RGB images. The repository currently contains only the
-reusable depth-estimation module. **No SLAM functionality exists yet.**
+estimated from ordinary RGB images. The repository currently contains the
+validated depth-estimation module and a small two-frame visual motion module.
+**No full SLAM functionality exists yet.**
 
 ## Current status
 
@@ -10,6 +11,10 @@ reusable depth-estimation module. **No SLAM functionality exists yet.**
 work. Video validation with `--sample-every 10` successfully processed 17
 sampled frames. The expected RGB, raw depth, visualization, comparison, and
 metadata outputs were created.
+
+The Stage 2 two-frame motion module is implemented and covered by offline unit
+and synthetic-geometry tests. A real-pair pose run still requires calibrated
+intrinsics for the camera that captured those frames.
 
 This status applies only to Stage 1 depth estimation; it does not imply that a
 3D SLAM pipeline has been implemented or validated.
@@ -102,12 +107,12 @@ available CUDA device and otherwise uses CPU. `--device cpu` forces CPU, while
 `--device cuda` requests CUDA and returns a clear error if CUDA is unavailable.
 Stage 1 was validated on CPU only; **CUDA has not been tested**.
 
-## Validated Environment
+## Stage 1 Validated Environment
 
 - Operating system: Windows
 - Python: 3.13.5
 - Inference device: CPU
-- Tests: 5 pytest tests passed
+- Stage 1 tests at validation: 5 pytest tests passed
 - Image inference: passed
 - Video inference: passed, including 17 frames sampled with `--sample-every 10`
 - CLI help: passed
@@ -134,12 +139,84 @@ files for unquantized predictions.
 Defaults are in `config/default.yaml`. A sampling interval of `1` processes all
 frames; `10` processes every tenth frame.
 
+## Stage 2: two-frame visual motion estimation
+
+Stage 2 estimates relative camera motion between exactly two RGB frames using
+classical calibrated two-view geometry:
+
+```text
+Frame 1 + Frame 2
+        |
+        v
+      SIFT
+        |
+        v
+descriptor matching (BFMatcher, L2)
+        |
+        v
+Lowe ratio test
+        |
+        v
+Essential Matrix + RANSAC
+        |
+        v
+recoverPose
+        |
+        v
+relative rotation R + translation direction t
+```
+
+SIFT detects distinctive image locations and describes the local appearance
+around them. BFMatcher compares those descriptors. The Lowe ratio test rejects
+an ambiguous match when its best candidate is not clearly better than its
+second-best candidate.
+
+The Essential Matrix represents the epipolar geometry between two views from a
+calibrated camera. RANSAC estimates it while rejecting correspondence outliers.
+OpenCV's `recoverPose` then recovers relative rotation `R` and translation
+direction `t` from the inlier correspondences.
+
+The length of `t` is **unknown**. A monocular two-view pair provides translation
+only up to scale, so Stage 2 does not report metres or metric camera motion.
+Depth Anything predictions are not used in this motion estimate.
+
+### Camera intrinsics
+
+Stage 2 requires calibrated pixel intrinsics `fx`, `fy`, `cx`, and `cy`. The
+values in `config/default.yaml` are intentionally `null`; the project does not
+invent calibration values. Set measured values in the config or pass all four
+on the command line.
+
+Example:
+
+```powershell
+py tools\run_motion.py data\frame1.jpg data\frame2.jpg --fx 1000 --fy 1000 --cx 960 --cy 540
+```
+
+The tool prints feature and inlier statistics, `R`, and the unknown-scale `t`
+direction. It saves a debug image to:
+
+```text
+outputs/motion/motion_<frame1>_<frame2>_<timestamp>/
+`-- matches.png  # inliers green; other Lowe-ratio matches orange
+```
+
+Thresholds for the Lowe test, RANSAC, minimum matches, and minimum inliers are
+configurable in `config/default.yaml` or through `py tools\run_motion.py --help`.
+The command returns a non-zero exit code when feature matching or pose recovery
+fails.
+
+Stage 2 is visual motion estimation between two frames only. It does not
+accumulate a trajectory and is not a full SLAM system.
+
 ## Current limitations
 
 - Depth is relative and uncalibrated, not metric.
 - Video frames are inferred independently with no temporal consistency step.
-- There is no SLAM, visual odometry, feature matching, camera motion estimation,
-  map fusion, keyframe handling, loop closure, GUI, or evaluation.
+- There is no trajectory accumulation, metric scale recovery, visual odometry
+  pipeline, map fusion, keyframe handling, loop closure, bundle adjustment,
+  point-cloud generation, GUI, or evaluation.
+- Stage 2 accepts two still frames; it is not a full-video motion or SLAM tool.
 - CPU inference is supported but can be slow.
 - Transformers output can differ slightly from the original repository's
   OpenCV preprocessing/upsampling path, as the official authors note.
