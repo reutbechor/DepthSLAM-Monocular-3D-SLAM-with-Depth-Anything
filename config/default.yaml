@@ -29,5 +29,15 @@ point_cloud:
   # Sample every fourth pixel in both image axes by default.
   stride: 4
 
+map:
+  # Mapping frames are simple samples, not loop-closure-aware keyframes.
+  sample_every: 10
+  max_mapping_frames: 5
+  # Arbitrary relative map step; this is not metres or recovered metric scale.
+  translation_step: 1.0
+  point_cloud_stride: 6
+  # Voxel size is expressed in relative map units, not metres.
+  voxel_size: 0.05
+
 output:
   directory: outputs

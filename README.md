@@ -2,8 +2,9 @@
 
 This university project will eventually explore monocular 3D SLAM using depth
 estimated from ordinary RGB images. The repository currently contains the
-validated depth-estimation module and a small two-frame visual motion module.
-**No full SLAM functionality exists yet.**
+validated depth-estimation stages plus an incremental relative mapping
+prototype for short videos. **It is not a complete SLAM system and it does not
+produce a metric map.**
 
 ## Current status
 
@@ -25,8 +26,10 @@ Stage 4 adds a dense colored relative point cloud for one frame plus standalone
 rigid-transform utilities. The single-frame CPU pipeline is validated on
 `data/frame1.jpg`. It still does not fuse frames or create a global map.
 
-This status applies only to Stage 1 depth estimation; it does not imply that a
-3D SLAM pipeline has been implemented or validated.
+Stage 5 composes accepted pairwise motions, transforms selected-frame clouds to
+the first camera's world frame, and voxel-downsamples them into one relative
+map. Its new components and small end-to-end CPU run are validated; details are
+in the Stage 5 section below.
 
 ## Depth Anything and this project
 
@@ -352,16 +355,111 @@ depth and is never applied automatically.
 These helpers are infrastructure only. Stage 4 performs no multi-frame fusion,
 trajectory accumulation, or global mapping.
 
+## Stage 5: incremental relative multi-frame mapping
+
+Stage 5 connects the existing modules for a short, sampled video sequence:
+
+```text
+sampled RGB frames
+    -> pairwise visual motion between consecutive accepted frames
+    -> sequential relative pose accumulation
+    -> per-accepted-frame Depth Anything relative depth
+    -> dense colored relative point cloud
+    -> camera cloud transformed into the common world frame
+    -> cloud fusion and NumPy voxel downsampling
+    -> relative multi-frame map and relative camera trajectory
+```
+
+The first sampled frame is accepted at identity and defines the world origin.
+OpenCV `recoverPose` describes the previous camera coordinates transformed into
+the current camera coordinates: `X_current = R @ X_previous + t`. The
+`PoseManager` stores the opposite convention, `T_world_camera`, so it inverts
+each accepted relative transform before composing it with the previous stored
+pose. Tests cover this convention with synthetic transforms and points.
+
+Monocular Essential Matrix geometry recovers only the direction of translation.
+For each accepted motion, Stage 5 normalizes that direction and assigns the
+configured `translation_step` magnitude. This is an **arbitrary relative mapping
+convention**, not recovered scale and not metres. Depth is also relative, so the
+combined coordinates are labeled `relative_map_units`; they should not be
+interpreted as physical dimensions.
+
+Mapping frames are selected by a fixed source-frame interval. This is simple
+frame sampling, not loop-closure-aware keyframe selection. A frame is rejected
+when feature matching, motion estimation, or depth/cloud generation fails. A
+rejected frame receives no invented pose or cloud; the next sampled frame is
+matched against the most recent accepted frame, and its reason is saved in
+`frame_stats.jsonl`.
+
+Voxel downsampling assigns finite points with
+`floor(point / voxel_size)` and averages the positions and RGB colors in every
+occupied voxel. It reduces duplicate/dense points deterministically without an
+Open3D dependency. `voxel_size` is in arbitrary relative map units, not metres.
+
+### Run relative mapping
+
+Use intrinsics calibrated for the source video. This deliberately small CPU
+example samples every twentieth source frame and considers at most five mapping
+frames:
+
+```powershell
+py tools\run_relative_map.py data\drone.mp4 --fx 730 --fy 730 --cx 636 --cy 321 --sample-every 20 --max-mapping-frames 5 --translation-step 1.0 --point-cloud-stride 8 --voxel-size 0.05 --device cpu
+```
+
+Defaults are under `map:` in `config/default.yaml`. Inspect all CLI options with:
+
+```powershell
+py tools\run_relative_map.py --help
+```
+
+Each invocation writes a new timestamped directory:
+
+```text
+outputs/relative_map/relative_map_<source>_<timestamp>/
+|-- global_relative_map.ply       # ASCII x y z red green blue
+|-- global_points_relative.npy    # finite Nx3 relative map coordinates
+|-- global_colors_rgb.npy         # matching Nx3 uint8 RGB colors
+|-- trajectory_relative.csv       # accepted frames only
+|-- trajectory_relative.npy       # accepted camera positions, Nx3
+|-- frame_stats.jsonl             # accepted/rejected status and reason per sample
+`-- metadata.json                 # parameters, counts, and non-metric labels
+```
+
+The trajectory CSV includes accepted frames only; rejected frames are retained
+in `frame_stats.jsonl`. Metadata explicitly records
+`map_type: relative_multi_frame`, `is_metric: false`, `depth_type: relative`,
+and `translation_scale: arbitrary_relative_step`.
+
+Stage 5 is an incremental relative mapping prototype, not a complete production
+SLAM system. Because motion is composed only from consecutive accepted pairs,
+small errors accumulate as drift; there is no global correction.
+
+### Stage 5 validated run
+
+The command above was executed on Windows with Python 3.13.5 and CPU inference
+using `data/drone.mp4`. It selected source frames 0, 20, 40, 60, and 80. All five
+were accepted, producing five relative trajectory poses, 64,395 raw fused
+points, and 44,130 points after voxel downsampling. The saved point and
+trajectory arrays were verified finite; colors were verified as matching
+`uint8` RGB values in both NumPy and PLY; and metadata was verified with
+`is_metric: false`. CUDA was not tested.
+
 ## Current limitations
 
 - Depth is relative and uncalibrated, not metric.
-- Video frames are inferred independently with no temporal consistency step.
-- There is no trajectory accumulation, metric scale recovery, visual odometry
-  pipeline, map fusion, keyframe handling, loop closure, bundle adjustment,
-  point-cloud generation, GUI, or evaluation.
+- Depth estimates are inferred independently; relative scale and shift can vary
+  between frames, with no temporal consistency correction.
+- Essential Matrix translation has unknown scale; `translation_step` is an
+  arbitrary visualization/pipeline convention, not recovered metric scale.
+- Sequential pose accumulation drifts over time.
+- There is no loop closure, bundle adjustment, pose graph optimization, global
+  relocalization, IMU/GNSS fusion, GUI, or ground-truth evaluation.
+- Mapping-frame selection is fixed sampling, not sophisticated keyframe logic.
 - Stage 2 accepts two still frames; it is not a full-video motion or SLAM tool.
 - Stage 3 points remain local to the Frame 1 camera and use relative depth units.
-- Stage 4 exports a single-camera relative PLY; it does not align or merge clouds.
+- Stage 4 exports a single-camera relative PLY; Stage 5 fuses multiple clouds
+  only in arbitrary relative map coordinates.
+- Approximate or incorrect camera intrinsics can distort motion and 3D geometry.
 - CPU inference is supported but can be slow.
 - Transformers output can differ slightly from the original repository's
   OpenCV preprocessing/upsampling path, as the official authors note.
