@@ -8,6 +8,7 @@ import numpy as np
 
 from .backprojection import backproject_pixels, validate_camera_matrix
 from .depth_types import CameraDepth
+from .robust_filtering import filter_depth_range
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,14 @@ class PointCloudResult:
     sampled_pixel_count: int
     valid_point_count: int
     stride: int
+    valid_depth_count_before_filter: int = 0
+    depth_outlier_rejected_count: int = 0
+    depth_filter_method: str = "none"
+    depth_percentile_low: float | None = None
+    depth_percentile_high: float | None = None
+    depth_lower_bound: float | None = None
+    depth_upper_bound: float | None = None
+    z_statistics: dict[str, float] | None = None
     coordinate_frame: str = "camera"
     coordinate_units: str = "relative_depth_units"
     depth_type: str = "relative"
@@ -31,6 +40,8 @@ def generate_colored_point_cloud(
     camera_depth: CameraDepth,
     camera_matrix: np.ndarray,
     stride: int = 1,
+    depth_percentile_low: float | None = None,
+    depth_percentile_high: float | None = None,
 ) -> PointCloudResult:
     """Backproject typed camera Z while preserving uint8 RGB colors."""
     image = np.asarray(image_rgb)
@@ -63,8 +74,20 @@ def generate_colored_point_cloud(
     valid = np.isfinite(sampled_depths) & (sampled_depths > 0.0)
     valid_pixels = pixels[valid].astype(np.float64, copy=False)
     valid_depths = sampled_depths[valid]
+    valid_colors = sampled_colors[valid]
+    if valid_depths.size == 0:
+        raise ValueError("camera depth has no finite positive sampled values")
+    depth_filter = filter_depth_range(
+        valid_depths,
+        is_metric=camera_depth.is_metric,
+        percentile_low=depth_percentile_low,
+        percentile_high=depth_percentile_high,
+    )
+    valid_pixels = valid_pixels[depth_filter.keep_mask]
+    valid_depths = valid_depths[depth_filter.keep_mask]
+    valid_colors = valid_colors[depth_filter.keep_mask]
     points = backproject_pixels(valid_pixels, valid_depths, intrinsics)
-    colors = sampled_colors[valid].astype(np.uint8, copy=False)
+    colors = valid_colors.astype(np.uint8, copy=False)
     return PointCloudResult(
         points=points,
         colors=colors,
@@ -72,6 +95,14 @@ def generate_colored_point_cloud(
         sampled_pixel_count=pixels.shape[0],
         valid_point_count=points.shape[0],
         stride=int(stride),
+        valid_depth_count_before_filter=depth_filter.input_count,
+        depth_outlier_rejected_count=depth_filter.rejected_count,
+        depth_filter_method=depth_filter.method,
+        depth_percentile_low=depth_filter.percentile_low,
+        depth_percentile_high=depth_filter.percentile_high,
+        depth_lower_bound=depth_filter.lower_bound,
+        depth_upper_bound=depth_filter.upper_bound,
+        z_statistics=depth_filter.statistics_before,
         coordinate_units=camera_depth.coordinate_units,
         depth_type=camera_depth.depth_type,
         depth_representation=camera_depth.representation,

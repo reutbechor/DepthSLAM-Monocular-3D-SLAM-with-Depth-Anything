@@ -41,6 +41,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cx", type=float, help="Calibrated principal point x (pixels)")
     parser.add_argument("--cy", type=float, help="Calibrated principal point y (pixels)")
     parser.add_argument("--stride", type=int, help="Sample every Nth pixel in x and y")
+    parser.add_argument(
+        "--disparity-denominator-epsilon", type=float,
+        help="Reject relative-disparity denominators at or below this value",
+    )
+    parser.add_argument(
+        "--depth-percentile-low", type=float,
+        help="Lower relative-Z percentile kept for point-cloud export",
+    )
+    parser.add_argument(
+        "--depth-percentile-high", type=float,
+        help="Upper relative-Z percentile kept for point-cloud export",
+    )
     parser.add_argument("--model", help="Hugging Face Depth Anything model ID")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--output-dir", type=Path, help="Root for generated outputs")
@@ -98,6 +110,21 @@ def main() -> int:
         image_bgr = load_image(args.image, "input image")
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         stride = args.stride if args.stride is not None else cloud_config.get("stride", 4)
+        denominator_epsilon = (
+            args.disparity_denominator_epsilon
+            if args.disparity_denominator_epsilon is not None
+            else cloud_config.get("disparity_denominator_epsilon", 1e-3)
+        )
+        depth_percentile_low = (
+            args.depth_percentile_low
+            if args.depth_percentile_low is not None
+            else cloud_config.get("depth_percentile_low", 1.0)
+        )
+        depth_percentile_high = (
+            args.depth_percentile_high
+            if args.depth_percentile_high is not None
+            else cloud_config.get("depth_percentile_high", 99.0)
+        )
 
         model_name = args.model or model_config.get("name", DEFAULT_MODEL)
         device = args.device or model_config.get("device", "auto")
@@ -105,10 +132,16 @@ def main() -> int:
         estimator = DepthEstimator(model_name=model_name, device=device)
         prediction = estimator.predict_result(image_bgr)
         camera_depth = prediction.to_camera_depth(
-            alignment_method="metric_model" if prediction.is_metric else "none"
+            alignment_method="metric_model" if prediction.is_metric else "none",
+            denominator_epsilon=float(denominator_epsilon),
         )
         cloud = generate_colored_point_cloud(
-            image_rgb, camera_depth, camera_matrix, stride=stride
+            image_rgb,
+            camera_depth,
+            camera_matrix,
+            stride=stride,
+            depth_percentile_low=depth_percentile_low,
+            depth_percentile_high=depth_percentile_high,
         )
 
         output_root = args.output_dir or Path(output_config.get("directory", "outputs"))
@@ -137,18 +170,35 @@ def main() -> int:
             "geometry_depth_representation": camera_depth.representation,
             "depth_conversion": camera_depth.conversion,
             "depth_alignment_method": camera_depth.alignment_method,
+            "disparity_alignment": {
+                "scale_a": camera_depth.disparity_scale,
+                "shift_b": camera_depth.disparity_shift,
+                "denominator_epsilon": camera_depth.denominator_epsilon,
+                "minimum_absolute_denominator": (
+                    camera_depth.minimum_absolute_denominator
+                ),
+                "rejected_small_denominator_count": (
+                    camera_depth.rejected_small_denominator_count
+                ),
+                "rejected_nonfinite_denominator_count": (
+                    camera_depth.rejected_nonfinite_denominator_count
+                ),
+                "rejected_invalid_z_count": camera_depth.rejected_invalid_z_count,
+            },
+            "depth_outlier_filter": {
+                "method": cloud.depth_filter_method,
+                "percentile_low": cloud.depth_percentile_low,
+                "percentile_high": cloud.depth_percentile_high,
+                "lower_bound": cloud.depth_lower_bound,
+                "upper_bound": cloud.depth_upper_bound,
+                "points_before": cloud.valid_depth_count_before_filter,
+                "points_rejected": cloud.depth_outlier_rejected_count,
+                "points_after": cloud.valid_point_count,
+            },
             "coordinate_frame": cloud.coordinate_frame,
             "coordinate_units": cloud.coordinate_units,
             "is_metric": prediction.is_metric,
-            "z_statistics": {
-                name: float(value) for name, value in zip(
-                    ("min", "p05", "median", "p95", "max"),
-                    np.percentile(
-                        camera_depth.values[np.isfinite(camera_depth.values)],
-                        (0, 5, 50, 95, 100),
-                    ),
-                )
-            },
+            "z_statistics": cloud.z_statistics,
             "note": (
                 "Relative coordinates are reciprocal disparity proxies, not metres."
                 if not prediction.is_metric
@@ -169,11 +219,25 @@ def main() -> int:
         print(f"Valid points: {cloud.valid_point_count}")
         print(f"Points shape: {cloud.points.shape}")
         print(f"RGB colors shape: {cloud.colors.shape}")
-        valid_z = camera_depth.values[np.isfinite(camera_depth.values)]
-        percentiles = np.percentile(valid_z, (0, 5, 50, 95, 100))
+        assert cloud.z_statistics is not None
         print(
-            "Camera Z statistics (min/p05/median/p95/max): "
-            + ", ".join(f"{value:.6f}" for value in percentiles)
+            "Usable sampled Z (min/p1/p5/median/p95/p99/max): "
+            + ", ".join(
+                f"{cloud.z_statistics[name]:.6f}"
+                for name in ("min", "p1", "p5", "median", "p95", "p99", "max")
+            )
+        )
+        print(
+            f"Depth outlier filter: {cloud.depth_filter_method}; removed "
+            f"{cloud.depth_outlier_rejected_count} of "
+            f"{cloud.valid_depth_count_before_filter} sampled valid depths"
+        )
+        print(
+            "Disparity denominator: "
+            f"epsilon={camera_depth.denominator_epsilon}, "
+            f"min_abs={camera_depth.minimum_absolute_denominator}, "
+            f"rejected_small={camera_depth.rejected_small_denominator_count}, "
+            f"rejected_nonfinite={camera_depth.rejected_nonfinite_denominator_count}"
         )
         if not prediction.is_metric:
             print(

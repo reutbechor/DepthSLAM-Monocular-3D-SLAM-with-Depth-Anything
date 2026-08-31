@@ -28,6 +28,10 @@ depth_geometry:
 point_cloud:
   # Sample every fourth pixel in both image axes by default.
   stride: 4
+  disparity_denominator_epsilon: 0.001
+  # Relative-Z tail suppression for visualization; this is not depth correction.
+  depth_percentile_low: 1.0
+  depth_percentile_high: 99.0
 
 map:
   # Mapping frames are simple samples, not loop-closure-aware keyframes.
@@ -44,6 +48,18 @@ map:
   point_cloud_stride: 6
   # Voxel size is expressed in relative map units, not metres.
   voxel_size: 0.05
+  disparity_denominator_epsilon: 0.001
+  # Applied only to relative depth; metric depth is not percentile-filtered.
+  depth_percentile_low: 1.0
+  depth_percentile_high: 99.0
+  # Center-distance tail suppression after voxel downsampling.
+  global_outlier_percentile: 99.5
+  # Heuristic pre-filter gates for aligned relative-depth reconstruction.
+  min_valid_depth_ratio: 0.60
+  max_denominator_reject_ratio: 0.30
+  min_depth_alignment_inliers: 500
+  min_depth_alignment_inlier_ratio: 0.30
+  max_relative_z_p99_over_median: 50.0
 
 output:
   directory: outputs

@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from src.depth_alignment import DepthAlignmentResult
 from src.map_builder import MappingFrame, RelativeMapBuilder
-from src.depth_types import DepthPrediction
+from src.depth_types import CameraDepth, DepthPrediction
 
 
 class FakeDepthEstimator:
@@ -71,11 +72,86 @@ class RejectingDepthPoseEstimator:
         )
 
 
+class SuccessfulDepthPoseEstimator:
+    def estimate(self, *args) -> SimpleNamespace:
+        del args
+        return SimpleNamespace(
+            success=True,
+            message="synthetic accepted pose",
+            valid_depth_correspondences=8,
+            pnp_inliers=8,
+            pnp_inlier_ratio=1.0,
+            reprojection_rmse_pixels=0.5,
+            reprojection_median_pixels=0.4,
+            translation_magnitude=0.1,
+            translation_units="relative_depth_units",
+            rotation=np.eye(3),
+            translation=np.array([0.1, 0.0, 0.0]),
+        )
+
+
+class RecordingFeatureTracker(FakeFeatureTracker):
+    def __init__(self) -> None:
+        self.reference_values: list[int] = []
+
+    def match(self, first: np.ndarray, second: np.ndarray) -> SimpleNamespace:
+        self.reference_values.append(int(first[0, 0, 0]))
+        return super().match(first, second)
+
+
+class RejectThenAcceptAligner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs) -> DepthAlignmentResult:
+        del args, kwargs
+        self.calls += 1
+        if self.calls == 1:
+            values = np.array([[1.0, np.nan], [np.nan, np.nan]], dtype=np.float32)
+            rejects = 3
+        else:
+            values = np.ones((2, 2), dtype=np.float32)
+            rejects = 0
+        depth = CameraDepth(
+            values,
+            "relative",
+            False,
+            "relative_camera_z_proxy",
+            "synthetic",
+            "relative_depth_units",
+            "reciprocal_affine_disparity_alignment",
+            "scale_and_shift",
+            disparity_scale=1.0,
+            disparity_shift=0.0,
+            denominator_epsilon=0.001,
+            rejected_small_denominator_count=rejects,
+        )
+        return DepthAlignmentResult(
+            True,
+            "synthetic alignment",
+            depth,
+            "scale_and_shift",
+            1000,
+            600,
+            1.0,
+            0.0,
+            0.0,
+        )
+
+
 class MapBuilderTests(unittest.TestCase):
     @staticmethod
     def frame(index: int) -> MappingFrame:
         return MappingFrame(
             image=np.zeros((2, 2, 3), dtype=np.uint8),
+            frame_index=index,
+            timestamp_seconds=index / 10.0,
+        )
+
+    @staticmethod
+    def marked_frame(index: int) -> MappingFrame:
+        return MappingFrame(
+            image=np.full((2, 2, 3), index, dtype=np.uint8),
             frame_index=index,
             timestamp_seconds=index / 10.0,
         )
@@ -158,6 +234,42 @@ class MapBuilderTests(unittest.TestCase):
         self.assertEqual(statistics.reason, "accepted_debug_fixed_step")
         self.assertEqual(statistics.scale_estimation_method, "fixed_step_debug")
         self.assertEqual(statistics.translation_units, "arbitrary_fixed_step_units")
+
+    def test_depth_quality_rejection_preserves_last_accepted_reference(self) -> None:
+        depth = FakeDepthEstimator()
+        tracker = RecordingFeatureTracker()
+        aligner = RejectThenAcceptAligner()
+        builder = RelativeMapBuilder(
+            depth_estimator=depth,
+            feature_tracker=tracker,
+            motion_estimator=SuccessfulGeometryEstimator(),
+            depth_pose_estimator=SuccessfulDepthPoseEstimator(),
+            depth_aligner=aligner,
+            camera_matrix=np.eye(3),
+            point_cloud_stride=1,
+            voxel_size=0.1,
+        )
+
+        result = builder.build([
+            self.marked_frame(0),
+            self.marked_frame(1),
+            self.marked_frame(2),
+        ])
+
+        self.assertEqual(result.accepted_frame_count, 2)
+        self.assertEqual(result.rejected_frame_count, 1)
+        self.assertEqual(result.raw_fused_point_count, 8)
+        np.testing.assert_array_equal(result.trajectory_frame_indices, [0, 2])
+        self.assertEqual(tracker.reference_values, [0, 0])
+        self.assertEqual(
+            result.frame_statistics[1].rejection_reason,
+            "depth_denominator_reject_ratio",
+        )
+        self.assertEqual(
+            result.frame_statistics[1].to_dict()["rejection_reason"],
+            "depth_denominator_reject_ratio",
+        )
+        self.assertTrue(result.frame_statistics[2].accepted)
 
 
 if __name__ == "__main__":

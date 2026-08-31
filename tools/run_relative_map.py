@@ -53,6 +53,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--point-cloud-stride", type=int)
     parser.add_argument("--voxel-size", type=float)
+    parser.add_argument("--disparity-denominator-epsilon", type=float)
+    parser.add_argument("--depth-percentile-low", type=float)
+    parser.add_argument("--depth-percentile-high", type=float)
+    parser.add_argument(
+        "--global-outlier-percentile", type=float,
+        help="Keep map points at or below this center-distance percentile",
+    )
+    parser.add_argument(
+        "--min-valid-depth-ratio", type=float,
+        help="Minimum full-frame finite positive aligned-depth fraction",
+    )
+    parser.add_argument(
+        "--max-denominator-reject-ratio", type=float,
+        help="Maximum unsafe aligned-disparity denominator fraction",
+    )
+    parser.add_argument(
+        "--min-depth-alignment-inliers", type=int,
+        help="Minimum robust affine depth-alignment inlier count",
+    )
+    parser.add_argument(
+        "--min-depth-alignment-inlier-ratio", type=float,
+        help="Minimum robust affine depth-alignment inlier fraction",
+    )
+    parser.add_argument(
+        "--max-relative-z-p99-over-median", type=float,
+        help="Maximum allowed aligned relative-Z p99/median ratio",
+    )
     parser.add_argument("--model", help="Hugging Face Depth Anything model ID")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--ratio-threshold", type=float)
@@ -170,6 +197,35 @@ def scientific_metadata(
     }
 
 
+def robustness_metadata(result: RelativeMapResult) -> dict[str, Any]:
+    """Return explicit pre/post counts and global geometry diagnostics."""
+    filtered = result.global_filter
+    return {
+        "raw_fused_point_count": result.raw_fused_point_count,
+        "voxel_downsampled_point_count": result.voxel_downsampled_point_count,
+        "global_outlier_filter": {
+            "method": filtered.method,
+            "percentile": filtered.percentile,
+            "distance_threshold": filtered.distance_threshold,
+            "points_before": filtered.input_count,
+            "points_rejected": filtered.rejected_count,
+            "points_after": filtered.output_count,
+        },
+        "global_geometry_diagnostics": {
+            "coordinate_statistics_before": filtered.coordinate_statistics_before,
+            "coordinate_statistics_after": filtered.coordinate_statistics_after,
+            "robust_center": [float(value) for value in filtered.robust_center],
+            "center_distance_statistics": filtered.distance_statistics,
+            "diagnostic_robust_radius_median_plus_6_scaled_mad": (
+                filtered.diagnostic_robust_radius
+            ),
+            "points_outside_diagnostic_robust_radius": (
+                filtered.points_outside_diagnostic_radius
+            ),
+        },
+    }
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -198,6 +254,51 @@ def main() -> int:
             args.point_cloud_stride, map_config, "point_cloud_stride", 6
         ))
         voxel_size = float(setting(args.voxel_size, map_config, "voxel_size", 0.05))
+        denominator_epsilon = float(setting(
+            args.disparity_denominator_epsilon,
+            map_config,
+            "disparity_denominator_epsilon",
+            1e-3,
+        ))
+        depth_percentile_low = setting(
+            args.depth_percentile_low, map_config, "depth_percentile_low", 1.0
+        )
+        depth_percentile_high = setting(
+            args.depth_percentile_high, map_config, "depth_percentile_high", 99.0
+        )
+        global_outlier_percentile = setting(
+            args.global_outlier_percentile,
+            map_config,
+            "global_outlier_percentile",
+            99.5,
+        )
+        min_valid_depth_ratio = setting(
+            args.min_valid_depth_ratio, map_config, "min_valid_depth_ratio", 0.60
+        )
+        max_denominator_reject_ratio = setting(
+            args.max_denominator_reject_ratio,
+            map_config,
+            "max_denominator_reject_ratio",
+            0.30,
+        )
+        min_depth_alignment_inliers = setting(
+            args.min_depth_alignment_inliers,
+            map_config,
+            "min_depth_alignment_inliers",
+            500,
+        )
+        min_depth_alignment_inlier_ratio = setting(
+            args.min_depth_alignment_inlier_ratio,
+            map_config,
+            "min_depth_alignment_inlier_ratio",
+            0.30,
+        )
+        max_relative_z_p99_over_median = setting(
+            args.max_relative_z_p99_over_median,
+            map_config,
+            "max_relative_z_p99_over_median",
+            50.0,
+        )
         if sample_every < 1 or maximum < 1 or cloud_stride < 1:
             raise ValueError("sampling, maximum frame count, and cloud stride must be positive")
 
@@ -222,6 +323,15 @@ def main() -> int:
             translation_step=translation_step,
             point_cloud_stride=cloud_stride,
             voxel_size=voxel_size,
+            disparity_denominator_epsilon=denominator_epsilon,
+            depth_percentile_low=depth_percentile_low,
+            depth_percentile_high=depth_percentile_high,
+            global_outlier_percentile=global_outlier_percentile,
+            min_valid_depth_ratio=min_valid_depth_ratio,
+            max_denominator_reject_ratio=max_denominator_reject_ratio,
+            min_depth_alignment_inliers=min_depth_alignment_inliers,
+            min_depth_alignment_inlier_ratio=min_depth_alignment_inlier_ratio,
+            max_relative_z_p99_over_median=max_relative_z_p99_over_median,
             depth_pose_estimator=DepthPoseEstimator(
                 minimum_correspondences=int(map_config.get(
                     "minimum_pnp_correspondences", 6
@@ -263,12 +373,35 @@ def main() -> int:
             "max_mapping_frames": maximum,
             "point_cloud_stride": cloud_stride,
             "voxel_size": voxel_size,
+            "depth_quality_thresholds": {
+                "min_valid_depth_ratio": min_valid_depth_ratio,
+                "max_denominator_reject_ratio": max_denominator_reject_ratio,
+                "min_depth_alignment_inliers": min_depth_alignment_inliers,
+                "min_depth_alignment_inlier_ratio": (
+                    min_depth_alignment_inlier_ratio
+                ),
+                "max_relative_z_p99_over_median": (
+                    max_relative_z_p99_over_median
+                ),
+            },
             "sampled_frames": result.sampled_frame_count,
             "accepted_frames": result.accepted_frame_count,
             "rejected_frames": result.rejected_frame_count,
+            "rejection_reason_counts": {
+                reason: sum(
+                    item.rejection_reason == reason
+                    for item in result.frame_statistics
+                )
+                for reason in sorted({
+                    item.rejection_reason
+                    for item in result.frame_statistics
+                    if item.rejection_reason is not None
+                })
+            },
             "trajectory_pose_count": result.trajectory_positions.shape[0],
             "initial_map_point_count": result.raw_fused_point_count,
             "final_map_point_count": result.fused_cloud.output_point_count,
+            **robustness_metadata(result),
             "trajectory_format": "accepted frames only; rejected frames are in frame_stats.jsonl",
             "note": (
                 "Relative-mode map uses propagated reciprocal-disparity units, not metres."
@@ -283,7 +416,12 @@ def main() -> int:
         print(f"Accepted mapping frames: {result.accepted_frame_count}")
         print(f"Rejected frames: {result.rejected_frame_count}")
         print(f"Raw fused points: {result.raw_fused_point_count}")
-        print(f"Downsampled map points: {result.fused_cloud.output_point_count}")
+        print(f"After voxel downsampling: {result.voxel_downsampled_point_count}")
+        print(
+            f"Global outliers rejected: {result.global_filter.rejected_count} "
+            f"({result.global_filter.method})"
+        )
+        print(f"Final map points: {result.fused_cloud.output_point_count}")
         print(f"Relative trajectory poses: {result.trajectory_positions.shape[0]}")
         for item in result.frame_statistics[1:]:
             if item.accepted:
@@ -301,6 +439,44 @@ def main() -> int:
                     )
             else:
                 print(f"Frame {item.frame_index}: rejected ({item.reason})")
+        for item in result.frame_statistics:
+            status = "accepted" if item.accepted else "rejected"
+            rejection = item.rejection_reason or "none"
+            print(
+                f"Frame {item.frame_index} quality: {status}, "
+                f"rejection={rejection}, PnP inliers={item.pnp_inliers}, "
+                f"RMSE={item.reprojection_rmse_pixels}, "
+                f"denominator reject ratio={item.denominator_rejection_ratio:.6f}, "
+                f"valid depth ratio={item.valid_aligned_depth_ratio:.6f}, "
+                f"alignment inliers={item.depth_alignment_inliers}, "
+                f"alignment inlier ratio={item.depth_alignment_inlier_ratio:.6f}, "
+                f"Z median={item.aligned_z_median}, Z p99={item.aligned_z_p99}, "
+                f"p99/median={item.relative_z_p99_over_median}"
+            )
+            if item.z_statistics is None:
+                continue
+            print(
+                f"  sampled pre-filter Z (min/p1/p5/median/p95/p99/max): "
+                + ", ".join(
+                    f"{item.z_statistics[name]:.6f}"
+                    for name in ("min", "p1", "p5", "median", "p95", "p99", "max")
+                )
+            )
+        for axis, statistics in (
+            result.global_filter.coordinate_statistics_after.items()
+        ):
+            print(
+                f"Global {axis.upper()} (min/p1/p5/median/p95/p99/max): "
+                + ", ".join(
+                    f"{statistics[name]:.6f}"
+                    for name in ("min", "p1", "p5", "median", "p95", "p99", "max")
+                )
+            )
+        print(
+            "Robust-center distance diagnostic: "
+            f"radius={result.global_filter.diagnostic_robust_radius:.6f}, "
+            f"outside={result.global_filter.points_outside_diagnostic_radius}"
+        )
         if scale_mode == "fixed-step":
             print("WARNING: fixed-step is an arbitrary DEBUG mode, not reconstruction.")
         if not result.is_metric:

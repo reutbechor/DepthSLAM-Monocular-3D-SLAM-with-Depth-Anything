@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from tools.run_relative_map import scientific_metadata
+from tools.run_relative_map import robustness_metadata, scientific_metadata
 
 
 class RelativeMapMetadataTests(unittest.TestCase):
@@ -38,6 +38,41 @@ class RelativeMapMetadataTests(unittest.TestCase):
         self.assertEqual(metadata["scale_estimation_method"], "fixed_step_debug")
         self.assertEqual(metadata["translation_scale"], "arbitrary_fixed_step_debug")
         self.assertEqual(metadata["translation_step"], 0.75)
+
+    def test_robustness_metadata_reports_pre_and_post_counts(self) -> None:
+        axis_statistics = {
+            axis: {name: 0.0 for name in (
+                "min", "p1", "p5", "median", "p95", "p99", "max"
+            )}
+            for axis in ("x", "y", "z")
+        }
+        result = SimpleNamespace(
+            raw_fused_point_count=200,
+            voxel_downsampled_point_count=100,
+            global_filter=SimpleNamespace(
+                method="median_center_distance_percentile",
+                percentile=99.5,
+                distance_threshold=5.0,
+                input_count=100,
+                rejected_count=1,
+                output_count=99,
+                coordinate_statistics_before=axis_statistics,
+                coordinate_statistics_after=axis_statistics,
+                robust_center=[0.0, 0.0, 0.0],
+                distance_statistics=axis_statistics["x"],
+                diagnostic_robust_radius=4.0,
+                points_outside_diagnostic_radius=2,
+            ),
+        )
+
+        metadata = robustness_metadata(result)
+
+        self.assertEqual(metadata["raw_fused_point_count"], 200)
+        self.assertEqual(metadata["voxel_downsampled_point_count"], 100)
+        filtering = metadata["global_outlier_filter"]
+        self.assertEqual(filtering["points_before"], 100)
+        self.assertEqual(filtering["points_rejected"], 1)
+        self.assertEqual(filtering["points_after"], 99)
 
 
 if __name__ == "__main__":

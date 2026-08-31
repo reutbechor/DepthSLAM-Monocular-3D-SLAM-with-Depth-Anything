@@ -30,6 +30,7 @@ def align_prediction_to_pose(
     pose: DepthPoseEstimateResult,
     *,
     minimum_correspondences: int = 6,
+    denominator_epsilon: float = 1e-3,
 ) -> DepthAlignmentResult:
     """Fit d=a/Z+b at PnP inliers and convert a relative prediction to Z."""
     if not pose.success or pose.rotation is None or pose.translation is None:
@@ -118,6 +119,7 @@ def align_prediction_to_pose(
             disparity_scale=scale,
             disparity_shift=shift,
             alignment_method="scale_and_shift",
+            denominator_epsilon=denominator_epsilon,
         )
     except ValueError as exc:
         return DepthAlignmentResult(

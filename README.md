@@ -330,11 +330,12 @@ Use real calibration values for the source camera:
 py tools\run_point_cloud.py data\frame1.jpg --fx 730 --fy 730 --cx 636 --cy 321 --stride 4
 ```
 
-The corrected CPU run used a 1272x642 image and produced 51,198 sampled pixels
-and 51,198 valid points. Camera-Z proxy statistics were: minimum 0.514849, 5th
-percentile 0.609269, median 1.000000, 95th percentile 3.343912, and maximum
-9.244245 relative units. The earlier invalid raw-as-Z interpretation had
-minimum/median/maximum 0.309172/2.858060/5.551260.
+The robustness-validation CPU run used a 1272x642 image and produced 51,198
+sampled valid depths. Its relative-Z 1st/99th percentile filter removed 1,024
+tail samples and exported 50,174 points. Pre-filter camera-Z proxy statistics
+were min/p1/p5/median/p95/p99/max =
+0.515010/0.560803/0.608739/1.000667/3.372398/5.750152/9.131558 relative units.
+The denominator guard rejected no samples in this unaligned first-frame case.
 
 The output is timestamped:
 
@@ -375,9 +376,13 @@ sampled RGB frames
     -> previous-frame camera-Z proxy + solvePnPRansac
     -> scaled relative R,t and sequential pose accumulation
     -> current-frame affine disparity scale/shift alignment
+    -> reject non-finite or numerically unsafe disparity denominators
+    -> pre-filter depth-alignment quality gate (accept or skip frame)
     -> dense colored relative point cloud
+    -> optional relative-Z percentile tail suppression
     -> camera cloud transformed into the common world frame
     -> cloud fusion and NumPy voxel downsampling
+    -> optional robust-center distance percentile filtering
     -> relative multi-frame map and relative camera trajectory
 ```
 
@@ -418,6 +423,70 @@ Voxel downsampling assigns finite points with
 occupied voxel. It reduces duplicate/dense points deterministically without an
 Open3D dependency. `voxel_size` is in arbitrary relative map units, not metres.
 
+### Stage 5 numerical robustness controls
+
+The affine conversion `Z = a / (raw_disparity - b)` rejects a sample when its
+denominator is non-finite, is not greater than the configured positive epsilon,
+or produces non-finite/non-positive Z. Invalid samples become missing values;
+they are never clamped to an invented distance. The default
+`disparity_denominator_epsilon` is `0.001`.
+
+Relative-mode point clouds then keep the configured central Z percentile range
+(`1.0` through `99.0` by default). This is optional tail/outlier suppression
+for usable visualization, not ground-truth depth correction. It is not applied
+automatically to metric predictions. The final voxelized map can similarly keep
+points within the configured center-distance percentile (`99.5` by default),
+measured from the coordinate-wise median map center.
+
+Both filters are explicit and auditable. `frame_stats.jsonl` records alignment
+`a`/`b`, the denominator epsilon and minimum absolute denominator, rejection
+counts, Z min/p1/p5/median/p95/p99/max, percentile bounds, and cloud counts.
+`metadata.json` preserves raw fused, voxel-downsampled, and final counts; global
+X/Y/Z percentiles before and after filtering; center-distance percentiles; and
+a median-plus-scaled-MAD radius diagnostic. Use
+`--disparity-denominator-epsilon`, `--depth-percentile-low`,
+`--depth-percentile-high`, and `--global-outlier-percentile` to override the
+defaults.
+Set both depth percentile values to `null` to disable the per-frame filter, or
+set `global_outlier_percentile: null` to disable the final global filter while
+retaining all diagnostics.
+
+### Depth-alignment acceptance gates
+
+Good PnP inlier counts and reprojection error establish pose quality, but they
+do not guarantee that the independently predicted relative depth aligns
+reliably. Before generating or filtering a candidate's dense cloud, the mapper
+therefore measures full-resolution, pre-filter alignment health and applies
+these configurable defaults from `map:` in `config/default.yaml`:
+
+```yaml
+min_valid_depth_ratio: 0.60
+max_denominator_reject_ratio: 0.30
+min_depth_alignment_inliers: 500
+min_depth_alignment_inlier_ratio: 0.30
+max_relative_z_p99_over_median: 50.0
+```
+
+The measurements include total depth candidates, valid aligned depths,
+denominator rejects and their ratios, robust alignment correspondences and
+inliers, aligned Z p1/median/p99, p99/median, and affine scale/shift. These are
+heuristic quality gates for relative-depth reconstruction, not learned
+confidence scores or metric guarantees. Each threshold can be disabled with
+`null` in the YAML configuration.
+
+If any enabled gate fails, `frame_stats.jsonl` records an exact
+`rejection_reason`, such as `depth_denominator_reject_ratio`,
+`depth_valid_ratio`, `depth_alignment_inliers`,
+`depth_alignment_inlier_ratio`, or `depth_z_distribution`. The candidate adds
+neither a cloud nor a pose and does not replace the previous accepted-frame
+reference. The next sample is still matched against the last accepted frame.
+There is no fixed-step fallback. Rejecting later frames when temporal relative
+depth degrades is a valid safer outcome than contaminating the map.
+
+The p1/p99 percentile cloud filter remains a separate post-acceptance
+visualization cleanup. A frame is never considered reliable merely because its
+extreme points can be filtered away.
+
 ### Run relative mapping
 
 Use intrinsics calibrated for the source video. This deliberately small CPU
@@ -443,8 +512,8 @@ outputs/relative_map/relative_map_<source>_<timestamp>/
 |-- global_colors_rgb.npy         # matching Nx3 uint8 RGB colors
 |-- trajectory_relative.csv       # accepted frames only
 |-- trajectory_relative.npy       # accepted camera positions, Nx3
-|-- frame_stats.jsonl             # accepted/rejected status and reason per sample
-`-- metadata.json                 # parameters, counts, and non-metric labels
+|-- frame_stats.jsonl             # frame status, Z/alignment/filter diagnostics
+`-- metadata.json                 # parameters, raw/filter counts, global statistics
 ```
 
 The trajectory CSV includes accepted frames only; rejected frames are retained
@@ -459,14 +528,40 @@ small errors accumulate as drift; there is no global correction.
 
 ### Stage 5 validated run
 
-The corrected command above was executed on Windows with Python 3.13.5 and CPU
+The robustness command above was executed on Windows with Python 3.13.5 and CPU
 inference using source frames 0, 20, 40, 60, and 80. All five were accepted.
 The four scaled translation magnitudes were 0.025817, 0.026099, 0.029411, and
-0.029453 relative-depth units; PnP retained 2,162, 2,024, 2,419, and 2,173
-inliers. The map contained 63,974 raw fused points and 16,051 points after voxel
-downsampling. Saved points and trajectory were finite, RGB remained `uint8`,
-and metadata was verified with `is_metric: false`, `scale_mode: depth-pnp`, and
-`translation_step: null`. CUDA was not tested.
+0.028908 relative-depth units; PnP retained 2,162, 2,024, 2,419, and 2,204
+inliers with RMSE 1.645, 1.731, 1.806, and 1.798 pixels. The map contained
+62,633 raw fused points and 15,339 after voxel downsampling. The configured
+99.5th center-distance percentile filter rejected 77 points and exported
+15,262. The exported points and trajectory were finite, RGB remained `uint8`,
+and the PLY vertex count matched metadata. The full suite passed 45 tests. CUDA
+was not tested.
+
+### Depth-quality gate validation
+
+The quality-gated mapper was also executed on CPU with:
+
+```powershell
+py tools\run_relative_map.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 15 --max-mapping-frames 8 --point-cloud-stride 8 --device cpu
+```
+
+Frames 0, 15, 30, 45, 60, 75, 90, and 105 were all accepted under the initial
+documented thresholds. This is recorded rather than hidden: the worst observed
+denominator-reject ratio was 0.039150 (below 0.30), the lowest valid-depth ratio
+was 0.960850 (above 0.60), the lowest non-origin alignment-inlier ratio was
+0.897641 (above 0.30), every alignment had more than 500 inliers, and the worst
+relative-Z p99/median ratio was 33.215475 (below 50.0). Therefore no quality
+gate fired in this particular run. The run produced 99,841 raw fused points,
+21,315 voxelized points, and 21,208 final points after 107 global outliers were
+removed. The full suite passed 53 tests after this correction. CUDA was not
+tested.
+
+These initial thresholds are deliberately visible and configurable. Tightening
+them changes the scientific acceptance policy and should be justified for the
+dataset; the implementation does not silently tune them merely to produce more
+accepted or rejected frames.
 
 For a focused two-frame report, run:
 
@@ -496,10 +591,14 @@ DJI aerial footage.
 - First-frame reciprocal conversion assumes zero disparity shift; it is only a
   relative-Z proxy. Per-frame affine alignment reduces but cannot eliminate
   model inconsistency.
+- Robust filtering removes numerical and relative-depth outliers; it does not
+  make the map metric or correct the underlying depth estimates.
+- Excessive percentile filtering can hide genuine scene geometry.
 - Depth estimates are inferred independently and can change across frames.
 - PnP translation is in propagated relative-depth units, not metres.
 - Fixed-step translation remains available only as explicit debug behavior.
 - Sequential pose accumulation drifts over time.
+- Outlier filtering does not replace bundle adjustment or loop closure.
 - There is no loop closure, bundle adjustment, pose graph optimization, global
   relocalization, IMU/GNSS fusion, GUI, or ground-truth evaluation.
 - Mapping-frame selection is fixed sampling, not sophisticated keyframe logic.

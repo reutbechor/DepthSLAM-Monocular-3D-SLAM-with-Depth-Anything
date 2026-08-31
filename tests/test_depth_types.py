@@ -36,6 +36,29 @@ class DepthTypeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(depth.values[0, 0]))
         self.assertTrue(np.isnan(depth.values[0, 1:]).all())
 
+    def test_aligned_denominator_at_or_below_epsilon_is_rejected(self) -> None:
+        prediction = DepthPrediction(
+            np.array([[1.0005, 1.01, 0.9, np.nan]], dtype=np.float32),
+            "relative",
+            False,
+            "relative_inverse_depth",
+            "synthetic",
+        )
+
+        depth = prediction.to_camera_depth(
+            disparity_scale=1.0,
+            disparity_shift=1.0,
+            alignment_method="synthetic_affine",
+            denominator_epsilon=0.001,
+        )
+
+        self.assertTrue(np.isnan(depth.values[0, 0]))
+        self.assertAlmostEqual(float(depth.values[0, 1]), 100.0, places=3)
+        self.assertTrue(np.isnan(depth.values[0, 2:]).all())
+        self.assertEqual(depth.rejected_small_denominator_count, 2)
+        self.assertEqual(depth.rejected_nonfinite_denominator_count, 1)
+        self.assertLess(depth.minimum_absolute_denominator, 0.001)
+
 
 if __name__ == "__main__":
     unittest.main()

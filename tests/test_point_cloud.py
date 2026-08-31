@@ -66,6 +66,40 @@ class PointCloudTests(unittest.TestCase):
         np.testing.assert_array_equal(result.colors, [image[0, 0], image[1, 2]])
         np.testing.assert_array_equal(result.valid_pixel_coordinates, [[0, 0], [2, 1]])
 
+    def test_relative_depth_percentiles_remove_extreme_tails(self) -> None:
+        image = np.zeros((1, 100, 3), dtype=np.uint8)
+        depth = np.ones((1, 100), dtype=np.float32)
+        depth[0, 0] = 0.01
+        depth[0, -1] = 1000.0
+
+        result = generate_colored_point_cloud(
+            image,
+            camera_depth(depth),
+            np.eye(3),
+            depth_percentile_low=1.0,
+            depth_percentile_high=99.0,
+        )
+
+        self.assertEqual(result.valid_depth_count_before_filter, 100)
+        self.assertEqual(result.depth_outlier_rejected_count, 2)
+        self.assertEqual(result.valid_point_count, 98)
+        self.assertTrue(np.all(result.points[:, 2] == 1.0))
+
+    def test_constant_relative_depth_is_unchanged_by_percentiles(self) -> None:
+        image = np.zeros((4, 5, 3), dtype=np.uint8)
+        depth = np.full((4, 5), 2.0, dtype=np.float32)
+
+        result = generate_colored_point_cloud(
+            image,
+            camera_depth(depth),
+            np.eye(3),
+            depth_percentile_low=1.0,
+            depth_percentile_high=99.0,
+        )
+
+        self.assertEqual(result.depth_outlier_rejected_count, 0)
+        self.assertEqual(result.valid_point_count, 20)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,11 @@ class CameraDepth:
     alignment_method: str
     disparity_scale: float | None = None
     disparity_shift: float | None = None
+    denominator_epsilon: float | None = None
+    minimum_absolute_denominator: float | None = None
+    rejected_small_denominator_count: int = 0
+    rejected_nonfinite_denominator_count: int = 0
+    rejected_invalid_z_count: int = 0
 
     def __post_init__(self) -> None:
         values = np.asarray(self.values)
@@ -59,7 +64,7 @@ class DepthPrediction:
         disparity_scale: float | None = None,
         disparity_shift: float = 0.0,
         alignment_method: str = "none",
-        minimum_denominator: float = 1e-6,
+        denominator_epsilon: float = 1e-3,
     ) -> CameraDepth:
         """Create positive camera Z values without changing their stated units.
 
@@ -69,13 +74,13 @@ class DepthPrediction:
         used as a nominal scale so a typical valid Z is near one.
         """
         raw = np.asarray(self.values, dtype=np.float64)
-        if not np.isfinite(minimum_denominator) or minimum_denominator <= 0.0:
-            raise ValueError("minimum_denominator must be finite and positive")
+        if not np.isfinite(denominator_epsilon) or denominator_epsilon <= 0.0:
+            raise ValueError("denominator_epsilon must be finite and positive")
 
         if self.is_metric:
             if disparity_scale is not None or disparity_shift != 0.0:
                 raise ValueError("disparity alignment cannot be applied to metric depth")
-            valid = np.isfinite(raw) & (raw > minimum_denominator)
+            valid = np.isfinite(raw) & (raw > 0.0)
             camera_z = np.full(raw.shape, np.nan, dtype=np.float64)
             camera_z[valid] = raw[valid]
             return CameraDepth(
@@ -89,7 +94,7 @@ class DepthPrediction:
                 alignment_method="metric_model",
             )
 
-        valid_raw = np.isfinite(raw) & (raw > minimum_denominator)
+        valid_raw = np.isfinite(raw) & (raw > 0.0)
         if not valid_raw.any():
             raise ValueError("relative inverse-depth prediction has no usable values")
         if disparity_scale is None:
@@ -103,14 +108,19 @@ class DepthPrediction:
             raise ValueError("disparity scale must be positive and scale/shift finite")
 
         denominator = raw - shift
-        adaptive_floor = max(
-            minimum_denominator,
-            minimum_denominator * float(np.median(np.abs(denominator[valid_raw]))),
+        finite_denominator = np.isfinite(denominator)
+        finite_values = denominator[finite_denominator]
+        minimum_absolute = (
+            float(np.min(np.abs(finite_values))) if finite_values.size else None
         )
-        valid = np.isfinite(denominator) & (denominator > adaptive_floor)
+        small_denominator = finite_denominator & (
+            denominator <= denominator_epsilon
+        )
+        valid = finite_denominator & (denominator > denominator_epsilon)
         camera_z = np.full(raw.shape, np.nan, dtype=np.float64)
         camera_z[valid] = scale / denominator[valid]
-        camera_z[~np.isfinite(camera_z) | (camera_z <= 0.0)] = np.nan
+        invalid_z = valid & (~np.isfinite(camera_z) | (camera_z <= 0.0))
+        camera_z[invalid_z] = np.nan
         if not np.isfinite(camera_z).any():
             raise ValueError("inverse-depth conversion produced no usable camera Z values")
         return CameraDepth(
@@ -124,4 +134,11 @@ class DepthPrediction:
             alignment_method=alignment_method,
             disparity_scale=scale,
             disparity_shift=shift,
+            denominator_epsilon=float(denominator_epsilon),
+            minimum_absolute_denominator=minimum_absolute,
+            rejected_small_denominator_count=int(np.count_nonzero(small_denominator)),
+            rejected_nonfinite_denominator_count=int(
+                np.count_nonzero(~finite_denominator)
+            ),
+            rejected_invalid_z_count=int(np.count_nonzero(invalid_z)),
         )

@@ -2,6 +2,13 @@
 
 from .depth_estimator import DepthEstimator
 from .depth_pose_estimator import DepthPoseEstimateResult, DepthPoseEstimator
+from .depth_quality import (
+    DepthAlignmentQualityMetrics,
+    DepthQualityAssessment,
+    DepthQualityThresholds,
+    assess_depth_alignment_quality,
+    measure_depth_alignment_quality,
+)
 from .depth_types import CameraDepth, DepthPrediction
 from .depth_geometry import DepthGeometryProcessor
 from .feature_tracker import FeatureTracker
@@ -10,12 +17,24 @@ from .map_fusion import FusedPointCloud, RelativeMapFusion, voxel_downsample
 from .motion_estimator import MotionEstimator
 from .point_cloud import PointCloudResult, generate_colored_point_cloud
 from .pose_manager import PoseManager
+from .robust_filtering import (
+    GlobalOutlierFilterResult,
+    coordinate_statistics,
+    distribution_statistics,
+    filter_depth_range,
+    filter_global_radius,
+)
 from .transforms import invert_transform, make_transform, transform_points
 
 __all__ = [
     "DepthEstimator",
     "DepthPoseEstimateResult",
     "DepthPoseEstimator",
+    "DepthAlignmentQualityMetrics",
+    "DepthQualityAssessment",
+    "DepthQualityThresholds",
+    "assess_depth_alignment_quality",
+    "measure_depth_alignment_quality",
     "CameraDepth",
     "DepthPrediction",
     "DepthGeometryProcessor",
@@ -30,6 +49,11 @@ __all__ = [
     "PointCloudResult",
     "generate_colored_point_cloud",
     "PoseManager",
+    "GlobalOutlierFilterResult",
+    "coordinate_statistics",
+    "distribution_statistics",
+    "filter_depth_range",
+    "filter_global_radius",
     "invert_transform",
     "make_transform",
     "transform_points",

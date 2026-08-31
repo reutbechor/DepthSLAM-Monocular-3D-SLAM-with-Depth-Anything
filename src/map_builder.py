@@ -11,11 +11,18 @@ import numpy as np
 from .backprojection import validate_camera_matrix
 from .depth_alignment import align_prediction_to_pose
 from .depth_pose_estimator import DepthPoseEstimator
+from .depth_quality import (
+    DepthAlignmentQualityMetrics,
+    DepthQualityThresholds,
+    assess_depth_alignment_quality,
+    measure_depth_alignment_quality,
+)
 from .depth_types import CameraDepth, DepthPrediction
 from .feature_tracker import FeatureTrackingError
 from .map_fusion import FusedPointCloud, RelativeMapFusion
 from .point_cloud import PointCloudResult, generate_colored_point_cloud
 from .pose_manager import PoseManager
+from .robust_filtering import GlobalOutlierFilterResult, filter_global_radius
 from .transforms import transform_points
 
 
@@ -32,6 +39,7 @@ class FrameMapStatistics:
     timestamp_seconds: float
     accepted: bool
     reason: str
+    rejection_reason: str | None = None
     good_matches: int = 0
     geometric_inliers: int = 0
     valid_depth_correspondences: int = 0
@@ -45,6 +53,30 @@ class FrameMapStatistics:
     depth_representation: str | None = None
     depth_alignment_method: str | None = None
     depth_alignment_inliers: int = 0
+    depth_alignment_input_correspondences: int = 0
+    depth_alignment_inlier_ratio: float = 0.0
+    disparity_scale: float | None = None
+    disparity_shift: float | None = None
+    denominator_epsilon: float | None = None
+    minimum_absolute_denominator: float | None = None
+    rejected_small_denominator_count: int = 0
+    rejected_nonfinite_denominator_count: int = 0
+    rejected_invalid_z_count: int = 0
+    total_depth_candidates: int = 0
+    valid_aligned_depth_count: int = 0
+    denominator_rejection_ratio: float = 0.0
+    valid_aligned_depth_ratio: float = 0.0
+    aligned_z_p1: float | None = None
+    aligned_z_median: float | None = None
+    aligned_z_p99: float | None = None
+    relative_z_p99_over_median: float | None = None
+    z_statistics: dict[str, float] | None = None
+    depth_filter_method: str | None = None
+    depth_percentile_low: float | None = None
+    depth_percentile_high: float | None = None
+    depth_lower_bound: float | None = None
+    depth_upper_bound: float | None = None
+    depth_outlier_rejected_count: int = 0
     cloud_points: int = 0
     camera_position: tuple[float, float, float] | None = None
 
@@ -58,7 +90,9 @@ class RelativeMapResult:
     accepted_frame_count: int
     rejected_frame_count: int
     raw_fused_point_count: int
+    voxel_downsampled_point_count: int
     fused_cloud: FusedPointCloud
+    global_filter: GlobalOutlierFilterResult
     trajectory_frame_indices: np.ndarray
     trajectory_positions: np.ndarray
     frame_statistics: list[FrameMapStatistics]
@@ -84,7 +118,17 @@ class RelativeMapBuilder:
         translation_step: float = 1.0,
         point_cloud_stride: int = 6,
         voxel_size: float = 0.05,
+        disparity_denominator_epsilon: float = 1e-3,
+        depth_percentile_low: float | None = 1.0,
+        depth_percentile_high: float | None = 99.0,
+        global_outlier_percentile: float | None = 99.5,
+        min_valid_depth_ratio: float | None = 0.60,
+        max_denominator_reject_ratio: float | None = 0.30,
+        min_depth_alignment_inliers: int | None = 500,
+        min_depth_alignment_inlier_ratio: float | None = 0.30,
+        max_relative_z_p99_over_median: float | None = 50.0,
         depth_pose_estimator: Any | None = None,
+        depth_aligner: Callable[..., Any] = align_prediction_to_pose,
         point_cloud_generator: Callable[..., PointCloudResult] = generate_colored_point_cloud,
     ) -> None:
         if scale_mode not in {"depth-pnp", "fixed-step"}:
@@ -106,6 +150,23 @@ class RelativeMapBuilder:
         self.voxel_size = float(voxel_size)
         if not np.isfinite(self.voxel_size) or self.voxel_size <= 0:
             raise ValueError("voxel_size must be finite and positive")
+        self.disparity_denominator_epsilon = float(disparity_denominator_epsilon)
+        if (
+            not np.isfinite(self.disparity_denominator_epsilon)
+            or self.disparity_denominator_epsilon <= 0.0
+        ):
+            raise ValueError("disparity_denominator_epsilon must be positive")
+        self.depth_percentile_low = depth_percentile_low
+        self.depth_percentile_high = depth_percentile_high
+        self.global_outlier_percentile = global_outlier_percentile
+        self.depth_quality_thresholds = DepthQualityThresholds(
+            min_valid_depth_ratio=min_valid_depth_ratio,
+            max_denominator_reject_ratio=max_denominator_reject_ratio,
+            min_depth_alignment_inliers=min_depth_alignment_inliers,
+            min_depth_alignment_inlier_ratio=min_depth_alignment_inlier_ratio,
+            max_relative_z_p99_over_median=max_relative_z_p99_over_median,
+        )
+        self.depth_aligner = depth_aligner
         self.point_cloud_generator = point_cloud_generator
 
     def _prediction(self, image_bgr: np.ndarray) -> DepthPrediction:
@@ -123,10 +184,61 @@ class RelativeMapBuilder:
             camera_depth,
             self.camera_matrix,
             stride=self.point_cloud_stride,
+            depth_percentile_low=self.depth_percentile_low,
+            depth_percentile_high=self.depth_percentile_high,
         )
         if cloud.valid_point_count == 0:
             raise RuntimeError("camera depth produced no valid point-cloud samples")
         return cloud
+
+    @staticmethod
+    def _depth_diagnostics(
+        camera_depth: CameraDepth,
+        cloud: PointCloudResult,
+        quality: DepthAlignmentQualityMetrics,
+    ) -> dict[str, Any]:
+        return {
+            **RelativeMapBuilder._quality_diagnostics(camera_depth, quality),
+            "z_statistics": cloud.z_statistics,
+            "depth_filter_method": cloud.depth_filter_method,
+            "depth_percentile_low": cloud.depth_percentile_low,
+            "depth_percentile_high": cloud.depth_percentile_high,
+            "depth_lower_bound": cloud.depth_lower_bound,
+            "depth_upper_bound": cloud.depth_upper_bound,
+            "depth_outlier_rejected_count": cloud.depth_outlier_rejected_count,
+        }
+
+    @staticmethod
+    def _quality_diagnostics(
+        camera_depth: CameraDepth,
+        quality: DepthAlignmentQualityMetrics,
+    ) -> dict[str, Any]:
+        return {
+            "disparity_scale": camera_depth.disparity_scale,
+            "disparity_shift": camera_depth.disparity_shift,
+            "denominator_epsilon": camera_depth.denominator_epsilon,
+            "minimum_absolute_denominator": camera_depth.minimum_absolute_denominator,
+            "rejected_small_denominator_count": (
+                camera_depth.rejected_small_denominator_count
+            ),
+            "rejected_nonfinite_denominator_count": (
+                camera_depth.rejected_nonfinite_denominator_count
+            ),
+            "rejected_invalid_z_count": camera_depth.rejected_invalid_z_count,
+            "total_depth_candidates": quality.total_depth_candidates,
+            "valid_aligned_depth_count": quality.valid_aligned_depth_count,
+            "denominator_rejection_ratio": quality.denominator_rejection_ratio,
+            "valid_aligned_depth_ratio": quality.valid_aligned_depth_ratio,
+            "depth_alignment_input_correspondences": (
+                quality.alignment_input_correspondences
+            ),
+            "depth_alignment_inliers": quality.alignment_inliers,
+            "depth_alignment_inlier_ratio": quality.alignment_inlier_ratio,
+            "aligned_z_p1": quality.aligned_z_p1,
+            "aligned_z_median": quality.aligned_z_median,
+            "aligned_z_p99": quality.aligned_z_p99,
+            "relative_z_p99_over_median": quality.relative_z_p99_over_median,
+        }
 
     @staticmethod
     def _validate_frame(frame: MappingFrame) -> None:
@@ -156,9 +268,15 @@ class RelativeMapBuilder:
         try:
             first_prediction = self._prediction(first.image)
             first_depth = first_prediction.to_camera_depth(
-                alignment_method="metric_model" if first_prediction.is_metric else "none"
+                alignment_method="metric_model" if first_prediction.is_metric else "none",
+                denominator_epsilon=self.disparity_denominator_epsilon,
             )
             first_cloud = self._camera_cloud(first.image, first_depth)
+            first_quality = measure_depth_alignment_quality(
+                first_depth,
+                alignment_input_correspondences=0,
+                alignment_inliers=0,
+            )
         except (RuntimeError, TypeError, ValueError) as exc:
             raise RuntimeError(f"first frame could not initialize the map: {exc}") from exc
         fusion.add(first_cloud.points, first_cloud.colors)
@@ -174,6 +292,7 @@ class RelativeMapBuilder:
             depth_alignment_method=first_depth.alignment_method,
             cloud_points=first_cloud.valid_point_count,
             camera_position=(0.0, 0.0, 0.0),
+            **self._depth_diagnostics(first_depth, first_cloud, first_quality),
         ))
         previous_accepted = first
         previous_depth = first_depth
@@ -186,7 +305,8 @@ class RelativeMapBuilder:
             except (FeatureTrackingError, RuntimeError, ValueError) as exc:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
-                    f"feature_matching_failed: {exc}"
+                    f"feature_matching_failed: {exc}",
+                    rejection_reason="feature_matching",
                 ))
                 continue
 
@@ -198,7 +318,9 @@ class RelativeMapBuilder:
             except (RuntimeError, ValueError) as exc:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
-                    f"geometric_motion_failed: {exc}", good_matches=good_matches
+                    f"geometric_motion_failed: {exc}",
+                    rejection_reason="geometric_filtering",
+                    good_matches=good_matches,
                 ))
                 continue
             if not geometry_pose.success:
@@ -207,6 +329,7 @@ class RelativeMapBuilder:
                     timestamp_seconds=frame.timestamp_seconds,
                     accepted=False,
                     reason=f"geometric_motion_rejected: {geometry_pose.message}",
+                    rejection_reason="geometric_filtering",
                     good_matches=good_matches,
                     geometric_inliers=geometry_pose.num_inliers,
                 ))
@@ -228,6 +351,7 @@ class RelativeMapBuilder:
                         frame.timestamp_seconds,
                         False,
                         f"depth_pnp_failed: {exc}",
+                        rejection_reason="pnp",
                         good_matches=good_matches,
                         geometric_inliers=geometry_pose.num_inliers,
                         scale_estimation_method="depth_pnp",
@@ -250,24 +374,32 @@ class RelativeMapBuilder:
                 if not scaled_pose.success:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
-                        f"depth_pnp_rejected: {scaled_pose.message}", **diagnostic
+                        f"depth_pnp_rejected: {scaled_pose.message}",
+                        rejection_reason="pnp",
+                        **diagnostic,
                     ))
                     continue
                 try:
                     prediction = self._prediction(frame.image)
-                    alignment = align_prediction_to_pose(
-                        prediction, matches.points2, scaled_pose
+                    alignment = self.depth_aligner(
+                        prediction,
+                        matches.points2,
+                        scaled_pose,
+                        denominator_epsilon=self.disparity_denominator_epsilon,
                     )
                 except (RuntimeError, TypeError, ValueError) as exc:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
-                        f"depth_alignment_failed: {exc}", **diagnostic
+                        f"depth_alignment_failed: {exc}",
+                        rejection_reason="depth_alignment",
+                        **diagnostic,
                     ))
                     continue
                 if not alignment.success or alignment.camera_depth is None:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
                         f"depth_alignment_rejected: {alignment.message}",
+                        rejection_reason="depth_alignment",
                         depth_alignment_method=alignment.method,
                         depth_alignment_inliers=alignment.inliers,
                         **diagnostic,
@@ -275,6 +407,27 @@ class RelativeMapBuilder:
                     continue
                 camera_depth = alignment.camera_depth
                 alignment_inliers = alignment.inliers
+                quality_assessment = assess_depth_alignment_quality(
+                    camera_depth,
+                    alignment_input_correspondences=alignment.input_correspondences,
+                    alignment_inliers=alignment.inliers,
+                    thresholds=self.depth_quality_thresholds,
+                )
+                if not quality_assessment.accepted:
+                    statistics.append(FrameMapStatistics(
+                        frame.frame_index,
+                        frame.timestamp_seconds,
+                        False,
+                        f"depth_quality_rejected: {quality_assessment.rejection_reason}",
+                        rejection_reason=quality_assessment.rejection_reason,
+                        depth_alignment_method=camera_depth.alignment_method,
+                        **self._quality_diagnostics(
+                            camera_depth, quality_assessment.metrics
+                        ),
+                        **diagnostic,
+                    ))
+                    continue
+                depth_quality = quality_assessment.metrics
                 rotation = scaled_pose.rotation
                 translation = scaled_pose.translation
                 assert rotation is not None and translation is not None
@@ -283,11 +436,15 @@ class RelativeMapBuilder:
             else:
                 try:
                     prediction = self._prediction(frame.image)
-                    camera_depth = prediction.to_camera_depth(alignment_method="none")
+                    camera_depth = prediction.to_camera_depth(
+                        alignment_method="none",
+                        denominator_epsilon=self.disparity_denominator_epsilon,
+                    )
                 except (RuntimeError, TypeError, ValueError) as exc:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
                         f"depth_failed: {exc}", good_matches=good_matches,
+                        rejection_reason="depth_alignment",
                         geometric_inliers=geometry_pose.num_inliers,
                         scale_estimation_method="fixed_step_debug",
                     ))
@@ -303,6 +460,11 @@ class RelativeMapBuilder:
                     scale_estimation_method=scale_method,
                     depth_representation=prediction.representation,
                 )
+                depth_quality = measure_depth_alignment_quality(
+                    camera_depth,
+                    alignment_input_correspondences=0,
+                    alignment_inliers=0,
+                )
 
             try:
                 camera_cloud = self._camera_cloud(frame.image, camera_depth)
@@ -310,8 +472,9 @@ class RelativeMapBuilder:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
                     f"point_cloud_rejected: {exc}",
+                    rejection_reason="point_cloud",
                     depth_alignment_method=camera_depth.alignment_method,
-                    depth_alignment_inliers=alignment_inliers,
+                    **self._quality_diagnostics(camera_depth, depth_quality),
                     **pose_diagnostic,
                 ))
                 continue
@@ -334,15 +497,34 @@ class RelativeMapBuilder:
                 accepted=True,
                 reason="accepted" if scale_method == "depth_pnp" else "accepted_debug_fixed_step",
                 depth_alignment_method=camera_depth.alignment_method,
-                depth_alignment_inliers=alignment_inliers,
                 cloud_points=camera_cloud.valid_point_count,
                 camera_position=position,
+                **self._depth_diagnostics(
+                    camera_depth, camera_cloud, depth_quality
+                ),
                 **pose_diagnostic,
             ))
             previous_accepted = frame
             previous_depth = camera_depth
 
-        fused = fusion.finalize()
+        voxelized = fusion.finalize()
+        global_filter = filter_global_radius(
+            voxelized.points,
+            voxelized.colors,
+            self.global_outlier_percentile,
+        )
+        fused = FusedPointCloud(
+            points=global_filter.points,
+            colors=global_filter.colors,
+            input_point_count=fusion.raw_point_count,
+            output_point_count=global_filter.output_count,
+            voxel_size=self.voxel_size,
+            coordinate_units=(
+                first_depth.coordinate_units
+                if self.scale_mode == "depth-pnp"
+                else "arbitrary_fixed_step_units"
+            ),
+        )
         accepted_count = sum(item.accepted for item in statistics)
         height, width = first.image.shape[:2]
         return RelativeMapResult(
@@ -350,7 +532,9 @@ class RelativeMapBuilder:
             accepted_frame_count=accepted_count,
             rejected_frame_count=sampled_count - accepted_count,
             raw_fused_point_count=fusion.raw_point_count,
+            voxel_downsampled_point_count=voxelized.output_point_count,
             fused_cloud=fused,
+            global_filter=global_filter,
             trajectory_frame_indices=np.asarray(trajectory_indices, dtype=np.int64),
             trajectory_positions=pose_manager.trajectory_positions(),
             frame_statistics=statistics,
