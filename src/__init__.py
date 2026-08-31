@@ -12,6 +12,13 @@ from .depth_quality import (
 from .depth_types import CameraDepth, DepthPrediction
 from .depth_geometry import DepthGeometryProcessor
 from .feature_tracker import FeatureTracker
+from .evaluation import (
+    EvaluationResult,
+    FRAME_METRIC_COLUMNS,
+    evaluate_run_directory,
+    generate_evaluation_plots,
+    write_evaluation_outputs,
+)
 from .map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
 from .map_fusion import FusedPointCloud, RelativeMapFusion, voxel_downsample
 from .keyframe_selector import (
@@ -47,6 +54,11 @@ __all__ = [
     "DepthPrediction",
     "DepthGeometryProcessor",
     "FeatureTracker",
+    "EvaluationResult",
+    "FRAME_METRIC_COLUMNS",
+    "evaluate_run_directory",
+    "generate_evaluation_plots",
+    "write_evaluation_outputs",
     "MappingFrame",
     "RelativeMapBuilder",
     "RelativeMapResult",

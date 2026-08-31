@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from time import perf_counter
 from typing import Any, Callable, Iterable
 
 import cv2
@@ -124,6 +125,7 @@ class RelativeMapResult:
     scale_mode: str
     translation_units: str
     keyframes_enabled: bool
+    stage_timings: dict[str, float]
 
 
 class RelativeMapBuilder:
@@ -191,9 +193,17 @@ class RelativeMapBuilder:
         self.keyframe_selector = keyframe_selector or KeyframeSelector()
         self.depth_aligner = depth_aligner
         self.point_cloud_generator = point_cloud_generator
+        self._stage_timings: dict[str, float] = {}
+
+    def _add_timing(self, name: str, seconds: float) -> None:
+        self._stage_timings[name] = self._stage_timings.get(name, 0.0) + seconds
 
     def _prediction(self, image_bgr: np.ndarray) -> DepthPrediction:
-        prediction = self.depth_estimator.predict_result(image_bgr)
+        started = perf_counter()
+        try:
+            prediction = self.depth_estimator.predict_result(image_bgr)
+        finally:
+            self._add_timing("depth_inference_seconds", perf_counter() - started)
         if not isinstance(prediction, DepthPrediction):
             raise TypeError("depth estimator must return a DepthPrediction")
         return prediction
@@ -202,14 +212,20 @@ class RelativeMapBuilder:
         self, image_bgr: np.ndarray, camera_depth: CameraDepth
     ) -> PointCloudResult:
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        cloud = self.point_cloud_generator(
-            image_rgb,
-            camera_depth,
-            self.camera_matrix,
-            stride=self.point_cloud_stride,
-            depth_percentile_low=self.depth_percentile_low,
-            depth_percentile_high=self.depth_percentile_high,
-        )
+        started = perf_counter()
+        try:
+            cloud = self.point_cloud_generator(
+                image_rgb,
+                camera_depth,
+                self.camera_matrix,
+                stride=self.point_cloud_stride,
+                depth_percentile_low=self.depth_percentile_low,
+                depth_percentile_high=self.depth_percentile_high,
+            )
+        finally:
+            self._add_timing(
+                "point_cloud_fusion_seconds", perf_counter() - started
+            )
         if cloud.valid_point_count == 0:
             raise RuntimeError("camera depth produced no valid point-cloud samples")
         return cloud
@@ -293,6 +309,13 @@ class RelativeMapBuilder:
 
     def build(self, frames: Iterable[MappingFrame]) -> RelativeMapResult:
         """Process selected frames; rejected frames receive no pose or cloud."""
+        pipeline_started = perf_counter()
+        self._stage_timings = {
+            "feature_motion_seconds": 0.0,
+            "depth_inference_seconds": 0.0,
+            "pnp_depth_alignment_seconds": 0.0,
+            "point_cloud_fusion_seconds": 0.0,
+        }
         iterator = iter(frames)
         try:
             first = next(iterator)
@@ -320,7 +343,11 @@ class RelativeMapBuilder:
             )
         except (RuntimeError, TypeError, ValueError) as exc:
             raise RuntimeError(f"first frame could not initialize the map: {exc}") from exc
+        fusion_started = perf_counter()
         fusion.add(first_cloud.points, first_cloud.colors)
+        self._add_timing(
+            "point_cloud_fusion_seconds", perf_counter() - fusion_started
+        )
         statistics.append(FrameMapStatistics(
             frame_index=first.frame_index,
             timestamp_seconds=first.timestamp_seconds,
@@ -346,9 +373,13 @@ class RelativeMapBuilder:
             sampled_count += 1
             frames_since_last_keyframe += 1
             self._validate_frame(frame)
+            visual_started = perf_counter()
             try:
                 matches = self.feature_tracker.match(previous_accepted.image, frame.image)
             except (FeatureTrackingError, RuntimeError, ValueError) as exc:
+                self._add_timing(
+                    "feature_motion_seconds", perf_counter() - visual_started
+                )
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
                     f"feature_matching_failed: {exc}",
@@ -364,6 +395,9 @@ class RelativeMapBuilder:
                     matches.points1, matches.points2, self.camera_matrix
                 )
             except (RuntimeError, ValueError) as exc:
+                self._add_timing(
+                    "feature_motion_seconds", perf_counter() - visual_started
+                )
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
                     f"geometric_motion_failed: {exc}",
@@ -373,6 +407,9 @@ class RelativeMapBuilder:
                     frames_since_last_keyframe=frames_since_last_keyframe,
                 ))
                 continue
+            self._add_timing(
+                "feature_motion_seconds", perf_counter() - visual_started
+            )
             if not geometry_pose.success:
                 statistics.append(FrameMapStatistics(
                     frame_index=frame.frame_index,
@@ -430,6 +467,7 @@ class RelativeMapBuilder:
 
             alignment_inliers = 0
             if self.scale_mode == "depth-pnp":
+                pose_started = perf_counter()
                 try:
                     scaled_pose = self.depth_pose_estimator.estimate(
                         matches.points1,
@@ -439,6 +477,9 @@ class RelativeMapBuilder:
                         self.camera_matrix,
                     )
                 except (RuntimeError, TypeError, ValueError) as exc:
+                    self._add_timing(
+                        "pnp_depth_alignment_seconds", perf_counter() - pose_started
+                    )
                     statistics.append(FrameMapStatistics(
                         frame.frame_index,
                         frame.timestamp_seconds,
@@ -454,6 +495,9 @@ class RelativeMapBuilder:
                         **keyframe_diagnostic,
                     ))
                     continue
+                self._add_timing(
+                    "pnp_depth_alignment_seconds", perf_counter() - pose_started
+                )
                 diagnostic = dict(
                     good_matches=good_matches,
                     geometric_inliers=geometry_pose.num_inliers,
@@ -478,9 +522,11 @@ class RelativeMapBuilder:
                         **diagnostic,
                     ))
                     continue
+                alignment_started: float | None = None
                 try:
                     depth_inference_executed = True
                     prediction = self._prediction(frame.image)
+                    alignment_started = perf_counter()
                     alignment = self.depth_aligner(
                         prediction,
                         matches.points2,
@@ -488,6 +534,11 @@ class RelativeMapBuilder:
                         denominator_epsilon=self.disparity_denominator_epsilon,
                     )
                 except (RuntimeError, TypeError, ValueError) as exc:
+                    if alignment_started is not None:
+                        self._add_timing(
+                            "pnp_depth_alignment_seconds",
+                            perf_counter() - alignment_started,
+                        )
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
                         f"depth_alignment_failed: {exc}",
@@ -498,6 +549,9 @@ class RelativeMapBuilder:
                         **diagnostic,
                     ))
                     continue
+                self._add_timing(
+                    "pnp_depth_alignment_seconds", perf_counter() - alignment_started
+                )
                 if not alignment.success or alignment.camera_depth is None:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
@@ -603,10 +657,14 @@ class RelativeMapBuilder:
                 world_pose = pose_manager.add_fixed_step_relative_pose(
                     rotation, translation, self.translation_step
                 )
+            fusion_started = perf_counter()
             world_points = transform_points(
                 camera_cloud.points, world_pose[:3, :3], world_pose[:3, 3]
             )
             fusion.add(world_points, camera_cloud.colors)
+            self._add_timing(
+                "point_cloud_fusion_seconds", perf_counter() - fusion_started
+            )
             position = tuple(float(value) for value in world_pose[:3, 3])
             trajectory_indices.append(frame.frame_index)
             statistics.append(FrameMapStatistics(
@@ -629,11 +687,15 @@ class RelativeMapBuilder:
             previous_depth = camera_depth
             frames_since_last_keyframe = 0
 
+        fusion_started = perf_counter()
         voxelized = fusion.finalize()
         global_filter = filter_global_radius(
             voxelized.points,
             voxelized.colors,
             self.global_outlier_percentile,
+        )
+        self._add_timing(
+            "point_cloud_fusion_seconds", perf_counter() - fusion_started
         )
         fused = FusedPointCloud(
             points=global_filter.points,
@@ -656,6 +718,9 @@ class RelativeMapBuilder:
             item.depth_inference_executed for item in statistics
         )
         height, width = first.image.shape[:2]
+        self._stage_timings["mapping_pipeline_seconds"] = (
+            perf_counter() - pipeline_started
+        )
         return RelativeMapResult(
             sampled_frame_count=sampled_count,
             accepted_frame_count=accepted_count,
@@ -681,4 +746,5 @@ class RelativeMapBuilder:
                 else "arbitrary_fixed_step_units"
             ),
             keyframes_enabled=self.keyframe_selector.thresholds.enabled,
+            stage_timings=dict(self._stage_timings),
         )

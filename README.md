@@ -36,6 +36,11 @@ fusion. It preserves every Stage 5 reliability gate and is validated on a
 30-candidate CPU run. It is a selection layer, not loop closure or global map
 optimization.
 
+**Stage 7 is complete and validated.** It evaluates saved Stage 5/6 artifacts,
+exports stable frame/run metrics, a relative trajectory, conservative reports,
+and optional plots. It does not modify poses or maps and does not add a SLAM
+optimization algorithm.
+
 ## Depth Anything and this project
 
 [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) is a
@@ -646,6 +651,99 @@ sequential drift, provide loop closure, guarantee optimal map coverage, or
 replace bundle adjustment. Its thresholds are dataset- and resolution-dependent
 heuristics for computational and mapping selection.
 
+## Stage 7: evaluation and reporting
+
+Stage 7 reads `metadata.json`, `frame_stats.jsonl`, and
+`trajectory_relative.csv` from a Stage 5/6 map run. It aggregates the artifacts
+without re-running SLAM logic when an existing run directory is supplied. Given
+a video instead, the CLI first invokes the existing relative-map pipeline and
+then evaluates the newly saved artifacts.
+
+Frame metrics include candidate status and rejection reason, feature matches,
+geometric inliers, keyframe motion, PnP inliers and reprojection residuals,
+relative translation magnitude, depth-alignment quality, depth-distribution
+quality, and contributed cloud points. Run metrics report accepted, skipped,
+and rejected counts; mean/median/range summaries; rejection-reason counts; map
+point counts; and lightweight stage timings.
+
+These metrics measure different forms of **internal consistency**:
+
+- Geometric and PnP inlier ratios describe how many tested correspondences
+  agree with the fitted models.
+- Reprojection RMSE is the pixel residual between matched observations and the
+  fitted PnP pose. It is not absolute trajectory accuracy.
+- Depth-alignment ratios describe agreement in the per-pair affine alignment
+  of relative inverse-depth predictions.
+- Denominator rejection and valid-depth ratios expose unsafe or invalid
+  relative-Z conversions.
+
+`drone_new.mp4` has no known external ground-truth trajectory. Stage 7 therefore
+does **not** calculate ATE or RPE, does not call reprojection error trajectory
+accuracy, and does not claim absolute map accuracy. Both trajectory coordinates
+and translation magnitudes are explicitly saved as `relative_depth_units`, not
+metres.
+
+Run mapping and evaluation together:
+
+```powershell
+py tools\run_evaluation.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 5 --max-candidate-frames 30 --point-cloud-stride 8 --device cpu --keyframes
+```
+
+The numeric intrinsics in this command are manually supplied and are labeled
+approximate by default. Use `--no-intrinsics-approximate` only for values from a
+valid calibration. To evaluate an existing map run without rerunning mapping:
+
+```powershell
+py tools\run_evaluation.py outputs\relative_map\relative_map_drone_new_<timestamp>
+```
+
+Use `--no-plots` for a report without matplotlib figures. Each invocation
+creates a timestamped directory:
+
+```text
+outputs/evaluation/evaluation_<source>_<timestamp>/
+|-- frame_metrics.csv
+|-- summary.json
+|-- trajectory.csv
+|-- evaluation_report.txt
+|-- geometric_inlier_ratio.png
+|-- pnp_inlier_ratio.png
+|-- reprojection_rmse.png
+|-- depth_alignment_inlier_ratio.png
+|-- denominator_rejection_ratio.png
+|-- frame_status.png
+|-- trajectory_xz.png
+`-- mapping/                         # present only for video-driven evaluation
+```
+
+Missing CSV values mean that a frame never reached the corresponding stage.
+`summary.json` records the model, device, scale mode, intrinsics and their
+provenance, keyframe settings, quality thresholds, map counts, units, runtime,
+and scientific limitations. `trajectory.csv` contains accepted keyframes only,
+aligned with their frame indices and timestamps.
+
+### Stage 7 validated run
+
+The exact command above was executed on Windows with Python 3.13.5 and CPU.
+The full suite passed with **71 tests and 4 subtests**; `run_evaluation.py
+--help` also passed. The 30 candidates produced 13 accepted keyframes, 0 skipped
+non-keyframes, 17 rejected frames, 14 depth inferences, 13 trajectory poses,
+and 34,013 final map points.
+
+For that run, geometric inlier ratio mean/median was
+0.380201/0.153467; PnP inlier ratio mean/median was 0.743173/0.729670;
+reprojection RMSE mean/median was 1.402504/1.428752 pixels; and depth-alignment
+inlier ratio mean/median was 0.969722/0.975904. The maximum denominator
+rejection ratio was 0.191795. Rejections were `geometric_filtering: 16` and
+`depth_z_distribution: 1`.
+
+The observed end-to-end wall time was 105.588 seconds, including process
+startup, model/cache checks, and blocked Hugging Face HEAD retries before the
+cached checkpoint loaded. Instrumented depth inference totaled 23.332 seconds
+(1.667 seconds per inference). These are observations from one run, not precise
+benchmarks: CPU load, hardware, model loading, cache state, network checks, and
+file I/O affect the measurements.
+
 For a focused two-frame report, run:
 
 ```powershell
@@ -684,6 +782,9 @@ DJI aerial footage.
 - Outlier filtering does not replace bundle adjustment or loop closure.
 - There is no loop closure, bundle adjustment, pose graph optimization, global
   relocalization, IMU/GNSS fusion, GUI, or ground-truth evaluation.
+- Stage 7 reports artifact-based internal consistency only; without an external
+  ground-truth trajectory it cannot report ATE, RPE, absolute drift, or map
+  accuracy.
 - Stage 6 keyframe decisions use heuristic image motion and may skip useful
   geometry or retain redundant views when thresholds are poorly chosen.
 - Stage 2 accepts two still frames; it is not a full-video motion or SLAM tool.

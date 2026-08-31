@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 from datetime import datetime
 from pathlib import Path
+import sys
+from time import perf_counter
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -251,6 +252,7 @@ def robustness_metadata(result: RelativeMapResult) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    pipeline_started = perf_counter()
     try:
         if not args.video.is_file():
             raise FileNotFoundError(f"Input video does not exist: {args.video}")
@@ -411,6 +413,7 @@ def main() -> int:
             ),
         )
         result = builder.build(selected_frames)
+        total_pipeline_runtime = perf_counter() - pipeline_started
 
         output_root = args.output_dir or Path(output_config.get("directory", "outputs"))
         run_directory = create_output_directory(output_root / "relative_map", args.video)
@@ -452,6 +455,26 @@ def main() -> int:
                     keyframe_thresholds.max_frames_without_keyframe
                 ),
             },
+            "motion_quality_thresholds": {
+                "ratio_threshold": builder.feature_tracker.ratio_threshold,
+                "minimum_matches": builder.feature_tracker.minimum_matches,
+                "ransac_probability": builder.motion_estimator.ransac_probability,
+                "ransac_threshold_pixels": builder.motion_estimator.ransac_threshold_pixels,
+                "minimum_inliers": builder.motion_estimator.minimum_inliers,
+                "minimum_inlier_ratio": builder.motion_estimator.minimum_inlier_ratio,
+            },
+            "pnp_quality_thresholds": {
+                "minimum_correspondences": (
+                    builder.depth_pose_estimator.minimum_correspondences
+                ),
+                "minimum_inliers": builder.depth_pose_estimator.minimum_inliers,
+                "minimum_inlier_ratio": (
+                    builder.depth_pose_estimator.minimum_inlier_ratio
+                ),
+                "reprojection_error_pixels": (
+                    builder.depth_pose_estimator.reprojection_error_pixels
+                ),
+            },
             "depth_quality_thresholds": {
                 "min_valid_depth_ratio": min_valid_depth_ratio,
                 "max_denominator_reject_ratio": max_denominator_reject_ratio,
@@ -470,6 +493,10 @@ def main() -> int:
             "skipped_non_keyframes": result.skipped_non_keyframe_count,
             "rejected_frames": result.rejected_frame_count,
             "depth_inference_count": result.depth_inference_count,
+            "runtime_metrics": {
+                "total_pipeline_runtime_seconds": total_pipeline_runtime,
+                **result.stage_timings,
+            },
             "rejection_reason_counts": {
                 reason: sum(
                     item.rejection_reason == reason
