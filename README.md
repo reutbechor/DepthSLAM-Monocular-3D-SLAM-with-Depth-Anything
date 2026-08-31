@@ -21,6 +21,10 @@ small set of relative 3D points in the Frame 1 camera coordinate system. It does
 not create or accumulate a map. The integrated CPU run was validated on
 `data/frame1.jpg` and `data/frame2.jpg` with the documented intrinsics.
 
+Stage 4 adds a dense colored relative point cloud for one frame plus standalone
+rigid-transform utilities. The single-frame CPU pipeline is validated on
+`data/frame1.jpg`. It still does not fuse frames or create a global map.
+
 This status applies only to Stage 1 depth estimation; it does not imply that a
 3D SLAM pipeline has been implemented or validated.
 
@@ -282,6 +286,72 @@ translation scale is unknown. No global point cloud or PLY file is produced.
 
 Stage 3 creates relative two-frame geometry only. It is not a global SLAM map.
 
+## Stage 4: dense colored relative point clouds
+
+Stage 4 has two independent parts:
+
+```text
+Stage 4A:
+RGB + Depth Anything relative depth + camera intrinsics
+    -> sampled dense colored relative point cloud
+
+Stage 4B:
+validated rigid coordinate transformations
+    -> infrastructure for a later map-fusion stage
+```
+
+A point cloud stores an `(X, Y, Z)` coordinate and an RGB color for every valid
+sampled pixel. The generator reuses Stage 3's pinhole backprojection, discards
+non-finite or non-positive depth, and keeps each source pixel's red, green, and
+blue values.
+
+The `stride` controls subsampling in both image axes. `stride=1` uses every
+pixel, while `stride=4` uses pixels 0, 4, 8, and so on in each row and column.
+Larger strides produce smaller files and require less memory.
+
+Points are expressed in the input camera coordinate frame. Their units are
+`relative_depth_units` because the Depth Anything V2 Small prediction is
+relative. **The point cloud is not metric and its coordinates are not metres.**
+
+### Run single-frame point-cloud generation
+
+Use real calibration values for the source camera:
+
+```powershell
+py tools\run_point_cloud.py data\frame1.jpg --fx 730 --fy 730 --cx 636 --cy 321 --stride 4
+```
+
+The validated CPU run used a 1272x642 image and produced 51,198 sampled pixels
+and 51,198 valid points. The point and RGB color arrays both have shape
+`(51198, 3)`. These are relative-depth coordinates, not metric measurements.
+
+The output is timestamped:
+
+```text
+outputs/point_cloud/point_cloud_<frame>_<timestamp>/
+|-- depth_raw.npy
+|-- depth_vis.png
+|-- points_3d_relative.npy
+|-- colors_rgb.npy
+|-- cloud_relative.ply
+`-- metadata.json
+```
+
+PLY is a simple point-cloud file format. This project writes an ASCII PLY with
+`x y z red green blue` per vertex and no viewer dependency. The colors are RGB,
+not OpenCV's BGR ordering.
+
+### Coordinate transforms
+
+`src/transforms.py` provides `transform_points`, `make_transform`, and
+`invert_transform`. Translation values supplied to these helpers must already
+use units compatible with the points. The unknown-scale unit translation
+direction from Stage 2 is **not** automatically compatible with Stage 4 relative
+depth and is never applied automatically.
+
+These helpers are infrastructure only. Stage 4 performs no multi-frame fusion,
+trajectory accumulation, or global mapping.
+
 ## Current limitations
 
 - Depth is relative and uncalibrated, not metric.
@@ -291,6 +361,7 @@ Stage 3 creates relative two-frame geometry only. It is not a global SLAM map.
   point-cloud generation, GUI, or evaluation.
 - Stage 2 accepts two still frames; it is not a full-video motion or SLAM tool.
 - Stage 3 points remain local to the Frame 1 camera and use relative depth units.
+- Stage 4 exports a single-camera relative PLY; it does not align or merge clouds.
 - CPU inference is supported but can be slow.
 - Transformers output can differ slightly from the original repository's
   OpenCV preprocessing/upsampling path, as the official authors note.

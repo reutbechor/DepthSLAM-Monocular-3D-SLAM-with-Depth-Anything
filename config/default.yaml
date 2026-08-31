@@ -25,5 +25,9 @@ motion:
 depth_geometry:
   sampling_method: bilinear
 
+point_cloud:
+  # Sample every fourth pixel in both image axes by default.
+  stride: 4
+
 output:
   directory: outputs
