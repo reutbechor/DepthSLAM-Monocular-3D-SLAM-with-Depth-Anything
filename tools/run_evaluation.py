@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", type=Path, default=Path("outputs/evaluation"),
         help="Root for timestamped evaluation directories",
     )
+    parser.add_argument(
+        "--refinement-dir", type=Path,
+        help="Optional matching Stage 8 refinement output directory",
+    )
     return parser.parse_args()
 
 
@@ -179,6 +183,7 @@ def main() -> int:
             total_runtime_seconds=runtime_override,
             intrinsics_source=intrinsics_source,
             intrinsics_approximate=intrinsics_approximate,
+            refinement_directory=args.refinement_dir,
         )
         paths = write_evaluation_outputs(
             result, evaluation_directory, plots=args.plots

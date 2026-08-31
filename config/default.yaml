@@ -72,5 +72,14 @@ map:
   min_depth_alignment_inlier_ratio: 0.30
   max_relative_z_p99_over_median: 50.0
 
+trajectory_refinement:
+  # Stage 8 is opt-in and never overwrites the raw accepted-pose trajectory.
+  enabled: false
+  mode: jump_aware
+  # Heuristic threshold: median step + multiplier * 1.4826 * MAD.
+  mad_multiplier: 4.0
+  # Position-only local average; rotations are never averaged element-wise.
+  moving_average_weights: [0.25, 0.50, 0.25]
+
 output:
   directory: outputs

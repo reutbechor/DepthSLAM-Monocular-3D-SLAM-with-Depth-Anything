@@ -41,6 +41,10 @@ exports stable frame/run metrics, a relative trajectory, conservative reports,
 and optional plots. It does not modify poses or maps and does not add a SLAM
 optimization algorithm.
 
+**Stage 8 is complete and validated.** It adds optional, position-only local trajectory
+diagnostics and refinement while preserving the raw accepted-pose trajectory.
+It is not loop closure, bundle adjustment, or ground-truth correction.
+
 ## Depth Anything and this project
 
 [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) is a
@@ -744,6 +748,101 @@ cached checkpoint loaded. Instrumented depth inference totaled 23.332 seconds
 benchmarks: CPU load, hardware, model loading, cache state, network checks, and
 file I/O affect the measurements.
 
+## Stage 8: lightweight trajectory refinement
+
+Sequential pose estimates can accumulate small local inconsistencies that
+appear as jitter, sharp direction changes, or isolated translation steps.
+Stage 8 analyzes an already saved accepted-keyframe trajectory and can apply a
+small, optional local average to positions. It does not rerun Depth Anything,
+feature matching, motion estimation, or mapping.
+
+For each consecutive accepted pose, Stage 8 computes translation-step
+magnitude. Interior poses also receive direction-change and second-difference
+diagnostics. These are geometric diagnostics in relative trajectory units;
+they are not physical velocity or acceleration.
+
+Suspicious steps use a robust threshold:
+
+```text
+threshold = median_step + mad_multiplier * 1.4826 * MAD(step)
+```
+
+MAD is the median absolute deviation. The default multiplier of `4.0` is a
+heuristic, not a metric-distance limit. A zero MAD is handled by using the
+median itself as the threshold, with only strictly larger steps flagged.
+
+Two position-only modes are available:
+
+- `jump_aware` is the default. It smooths only an interior pose targeted by a
+  suspicious incoming step. Normal neighbors and both endpoints remain
+  unchanged.
+- `moving_average` applies the configured `[0.25, 0.50, 0.25]` weights to every
+  interior position. It may suppress real motion as well as noise.
+
+Rotations are not modified because averaging rotation matrices element-wise
+does not preserve valid SO(3) rotations. All output coordinates remain
+`relative_depth_units`, not metres. The original map-run files are never
+overwritten.
+
+Refine an existing map run and generate both plots:
+
+```powershell
+py tools\run_trajectory_refinement.py outputs\relative_map\relative_map_drone_new_<timestamp> --mode jump_aware --mad-multiplier 4.0 --plots
+```
+
+The Stage 8 CLI is an explicit opt-in operation; `trajectory_refinement.enabled`
+remains `false` in `config/default.yaml` so refinement is never silently added
+to mapping. Each invocation writes a new timestamped directory:
+
+```text
+outputs/trajectory_refinement/trajectory_refinement_<run>_<timestamp>/
+|-- trajectory_raw.csv
+|-- trajectory_raw.npy
+|-- trajectory_refined.csv
+|-- trajectory_refined.npy
+|-- trajectory_diagnostics.csv
+|-- trajectory_raw_vs_refined_xz.png
+|-- trajectory_step_magnitude.png
+`-- refinement_summary.json
+```
+
+Raw and refined CSV rows preserve accepted frame order and timestamps and carry
+both `trajectory_type` and `trajectory_units`. The summary records the robust
+threshold, suspicious pose/frame indices, modified poses, before/after
+smoothness metrics, and scientific limitations.
+
+Stage 7 can include a matching refinement summary without changing its original
+metric definitions:
+
+```powershell
+py tools\run_evaluation.py outputs\relative_map\relative_map_drone_new_<timestamp> --refinement-dir outputs\trajectory_refinement\trajectory_refinement_<run>_<timestamp>
+```
+
+The refined trajectory is an analysis artifact only. The dense fused map still
+comes from the raw accepted poses; Stage 8 does not move map points or claim a
+refined map. A shorter or smoother path is not automatically more accurate.
+Smoothing does not recover ground truth, resolve scale ambiguity, correct
+accumulated drift, or replace loop closure, bundle adjustment, or pose-graph
+optimization.
+
+### Stage 8 validated run
+
+The saved 13-pose trajectory from the Stage 7 `drone_new` run was refined
+without rerunning the model or mapper, using `jump_aware`, MAD multiplier `4.0`,
+and weights `[0.25, 0.50, 0.25]`. The median step was 0.012718 relative units,
+MAD was 0.000901, and the robust threshold was 0.018060. The maximum observed
+step was 0.017889, so no jump exceeded the threshold. Zero poses were modified;
+this unchanged result is the intended conservative behavior, not a failed run.
+
+Both raw and refined trajectories contained 13 poses. Their mean/median step
+magnitudes were 0.013722/0.012718, step standard deviation was 0.002411, and
+maximum step was 0.017889. Mean/median/maximum second differences were
+0.006312/0.005699/0.013029. Both relative path lengths were 0.164666. No claim
+of trajectory accuracy follows from these smoothness values.
+
+The full suite passed with **84 tests and 4 subtests**, and both the Stage 8 CLI
+help and Stage 7 `--refinement-dir` integration were executed successfully.
+
 For a focused two-frame report, run:
 
 ```powershell
@@ -785,6 +884,8 @@ DJI aerial footage.
 - Stage 7 reports artifact-based internal consistency only; without an external
   ground-truth trajectory it cannot report ATE, RPE, absolute drift, or map
   accuracy.
+- Stage 8 is local position smoothing only. It does not refine rotations or the
+  fused map, and smoothness must not be interpreted as trajectory accuracy.
 - Stage 6 keyframe decisions use heuristic image motion and may skip useful
   geometry or retain redundant views when thresholds are poorly chosen.
 - Stage 2 accepts two still frames; it is not a full-video motion or SLAM tool.

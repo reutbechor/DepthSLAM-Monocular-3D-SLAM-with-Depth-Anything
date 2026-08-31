@@ -40,6 +40,19 @@ from .robust_filtering import (
     filter_global_radius,
 )
 from .transforms import invert_transform, make_transform, transform_points
+from .trajectory_refinement import (
+    JumpDetectionResult,
+    TrajectoryData,
+    TrajectoryDiagnostics,
+    TrajectoryMetrics,
+    TrajectoryRefinementResult,
+    detect_suspicious_jumps,
+    load_map_trajectory,
+    refine_trajectory,
+    trajectory_diagnostics,
+    trajectory_metrics,
+    write_refinement_outputs,
+)
 
 __all__ = [
     "DepthEstimator",
@@ -83,4 +96,15 @@ __all__ = [
     "invert_transform",
     "make_transform",
     "transform_points",
+    "JumpDetectionResult",
+    "TrajectoryData",
+    "TrajectoryDiagnostics",
+    "TrajectoryMetrics",
+    "TrajectoryRefinementResult",
+    "detect_suspicious_jumps",
+    "load_map_trajectory",
+    "refine_trajectory",
+    "trajectory_diagnostics",
+    "trajectory_metrics",
+    "write_refinement_outputs",
 ]

@@ -256,12 +256,44 @@ def _runtime_summary(
     }
 
 
+def _trajectory_refinement_summary(
+    run_path: Path, refinement_directory: Path | None
+) -> dict[str, Any]:
+    if refinement_directory is None:
+        candidate = run_path / "refinement_summary.json"
+        if not candidate.is_file():
+            return {"enabled": False}
+        summary_path = candidate
+    else:
+        summary_path = Path(refinement_directory).resolve() / "refinement_summary.json"
+    summary = _load_json(summary_path)
+    source = summary.get("source_run_directory")
+    if source is None or Path(source).resolve() != run_path:
+        raise ValueError(
+            "refinement summary source does not match the evaluated map run"
+        )
+    refinement = summary.get("trajectory_refinement")
+    if not isinstance(refinement, dict) or not refinement.get("enabled"):
+        raise ValueError("refinement_summary.json has no enabled refinement result")
+    return {
+        "enabled": True,
+        "method": refinement.get("method"),
+        "suspicious_jump_count": refinement.get("suspicious_jump_count"),
+        "modified_pose_count": refinement.get("modified_pose_count"),
+        "raw_metrics": refinement.get("raw_metrics"),
+        "refined_metrics": refinement.get("refined_metrics"),
+        "source_directory": str(summary_path.parent),
+        "map_geometry_note": summary.get("map_geometry_note"),
+    }
+
+
 def evaluate_run_directory(
     run_directory: Path,
     *,
     total_runtime_seconds: float | None = None,
     intrinsics_source: str | None = None,
     intrinsics_approximate: bool | None = None,
+    refinement_directory: Path | None = None,
 ) -> EvaluationResult:
     run_path = Path(run_directory).resolve()
     metadata = _load_json(run_path / "metadata.json")
@@ -373,6 +405,9 @@ def evaluate_run_directory(
             candidate_count=candidate_count,
             accepted_count=accepted_count,
             depth_count=depth_count,
+        ),
+        "trajectory_refinement": _trajectory_refinement_summary(
+            run_path, refinement_directory
         ),
         "ground_truth": {
             "available": False,
@@ -509,6 +544,7 @@ def write_evaluation_report(path: Path, summary: dict[str, Any]) -> Path:
     map_summary = summary["map"]
     runtime = summary["runtime"]
     rejection_counts = summary["rejection_reason_counts"]
+    refinement = summary["trajectory_refinement"]
     lines = [
         "DepthSLAM Stage 7 Evaluation Report",
         "===================================",
@@ -551,8 +587,24 @@ def write_evaluation_report(path: Path, summary: dict[str, Any]) -> Path:
         f"- Average depth inference seconds: "
         f"{runtime['average_depth_inference_seconds']}",
         "",
-        "Rejection reasons",
+        "Trajectory refinement",
+        f"- Enabled: {refinement['enabled']}",
     ]
+    if refinement["enabled"]:
+        lines.extend([
+            f"- Method: {refinement['method']}",
+            f"- Suspicious jumps: {refinement['suspicious_jump_count']}",
+            f"- Modified poses: {refinement['modified_pose_count']}",
+            f"- Raw path length (relative units): "
+            f"{refinement['raw_metrics']['total_path_length_relative_units']}",
+            f"- Refined path length (relative units): "
+            f"{refinement['refined_metrics']['total_path_length_relative_units']}",
+            "- The fused map remains based on raw accepted poses.",
+        ])
+    lines.extend([
+        "",
+        "Rejection reasons",
+    ])
     lines.extend(
         f"- {reason}: {count}" for reason, count in rejection_counts.items()
     )

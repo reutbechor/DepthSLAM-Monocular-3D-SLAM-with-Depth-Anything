@@ -247,3 +247,48 @@ def test_runtime_fields_are_non_negative_and_negative_values_fail(
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     with pytest.raises(ValueError, match="cannot be negative"):
         evaluate_run_directory(artifact_run)
+
+
+def test_evaluation_reports_refinement_absent(artifact_run: Path) -> None:
+    summary = evaluate_run_directory(artifact_run).summary
+    assert summary["trajectory_refinement"] == {"enabled": False}
+    assert summary["ground_truth"]["ate_computed"] is False
+    assert summary["ground_truth"]["rpe_computed"] is False
+
+
+def test_evaluation_reports_matching_refinement(
+    artifact_run: Path, tmp_path: Path
+) -> None:
+    refinement_directory = tmp_path / "refinement"
+    refinement_directory.mkdir()
+    refinement = {
+        "source_run_directory": str(artifact_run.resolve()),
+        "trajectory_refinement": {
+            "enabled": True,
+            "method": "jump_aware",
+            "suspicious_jump_count": 1,
+            "modified_pose_count": 1,
+            "raw_metrics": {
+                "total_path_length_relative_units": 4.0,
+                "trajectory_units": "relative_depth_units",
+            },
+            "refined_metrics": {
+                "total_path_length_relative_units": 3.5,
+                "trajectory_units": "relative_depth_units",
+            },
+        },
+        "map_geometry_note": "Map remains raw.",
+    }
+    (refinement_directory / "refinement_summary.json").write_text(
+        json.dumps(refinement), encoding="utf-8"
+    )
+    summary = evaluate_run_directory(
+        artifact_run, refinement_directory=refinement_directory
+    ).summary
+    assert summary["trajectory_refinement"]["enabled"] is True
+    assert summary["trajectory_refinement"]["method"] == "jump_aware"
+    assert summary["trajectory_refinement"]["raw_metrics"][
+        "trajectory_units"
+    ] == "relative_depth_units"
+    assert summary["ground_truth"]["ate_computed"] is False
+    assert summary["ground_truth"]["rpe_computed"] is False
