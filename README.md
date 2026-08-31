@@ -45,6 +45,84 @@ optimization algorithm.
 diagnostics and refinement while preserving the raw accepted-pose trajectory.
 It is not loop closure, bundle adjustment, or ground-truth correction.
 
+**Stage 9 is the final engineering stage.** It packages the existing mapper,
+evaluation, and optional trajectory refinement into one reproducible CLI and
+one verified final-run directory. It does not introduce a new SLAM algorithm.
+
+## Quick Start / Final Pipeline
+
+After completing the setup below, run the full existing pipeline once:
+
+```powershell
+py tools\run_pipeline.py data\video.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 5 --max-candidate-frames 30 --point-cloud-stride 8 --device cpu --keyframes --refine-trajectory
+```
+
+The CLI runs relative mapping once, evaluates its saved artifacts, optionally
+refines the saved position trajectory, and creates a timestamped directory
+under `outputs/final_pipeline/`. Its main files are:
+
+- `final_summary.json`: compact scientific and numerical run result;
+- `run_manifest.json`: exact arguments, environment versions, input metadata,
+  and resolved thresholds;
+- `FINAL_REPORT.md`: conservative machine-generated experiment report;
+- `artifacts.json`: verified index of mapping, evaluation, refinement, and final
+  files;
+- `mapping/`, `evaluation/`, and optionally `trajectory_refinement/`.
+
+The four intrinsics are required and are recorded as manually supplied and
+approximate. The `800/800/636/321` example is uncalibrated and specific to the
+current DJI experiment. A different camera requires appropriate intrinsics;
+incorrect values can warp the recovered geometry. The CLI always prints this
+warning and never labels manual values as calibrated.
+
+### Final architecture
+
+```text
+monocular RGB video
+  -> sampled frame candidates
+  -> SIFT feature matching
+  -> Essential Matrix + RANSAC geometric filtering
+  -> visual keyframe selection
+  -> Depth Anything V2 relative inverse-depth inference
+  -> explicit relative camera-Z conversion
+  -> depth-assisted PnP translation scale
+  -> per-pair depth scale/shift alignment
+  -> geometric and depth quality gates
+  -> sequential camera-pose accumulation
+  -> colored camera-frame point clouds
+  -> world transformation and voxel fusion
+  -> relative, non-metric 3D map
+  -> artifact-based evaluation
+  -> optional position-only trajectory refinement
+  -> verified final report and reproducibility manifest
+```
+
+This remains a sequential monocular relative-mapping prototype. It has no loop
+closure, bundle adjustment, pose-graph optimization, GNSS/GPS integration, or
+GUI, and it makes no absolute-accuracy claim.
+
+### Final pipeline validated run
+
+The Quick Start command was executed on `data/drone_new.mp4` with the shown
+intrinsics, CPU, sampling interval 5, 30 candidate frames, point-cloud stride
+8, keyframes enabled, and trajectory refinement enabled. The video is 1272 x
+642 at 30 FPS with 173 frames.
+
+The final run accepted 13 keyframes, skipped 0 candidates, rejected 17, ran 14
+depth inferences, saved 13 trajectory poses, and produced 34,013 final map
+points. Mean/median PnP inlier ratio was 0.743173/0.729670; mean/median
+reprojection RMSE was 1.402504/1.428752 pixels; and mean/median depth-alignment
+inlier ratio was 0.969722/0.975904. Rejections were
+`geometric_filtering: 16` and `depth_z_distribution: 1`.
+
+Jump-aware refinement completed with zero suspicious jumps and zero modified
+poses. Observed wall times were 100.878 seconds for mapping, 0.950 seconds for
+evaluation, 0.226 seconds for refinement, and 102.152 seconds end-to-end. The
+mapping time includes blocked Hugging Face network checks before the cached
+checkpoint loaded, so these values are environment-specific observations, not
+benchmarks. The artifact index verified 28 referenced files. The full suite
+passed with **93 tests and 4 subtests**, and `run_pipeline.py --help` passed.
+
 ## Depth Anything and this project
 
 [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) is a
