@@ -19,6 +19,7 @@ from .depth_quality import (
 )
 from .depth_types import CameraDepth, DepthPrediction
 from .feature_tracker import FeatureTrackingError
+from .keyframe_selector import KeyframeSelectionResult, KeyframeSelector
 from .map_fusion import FusedPointCloud, RelativeMapFusion
 from .point_cloud import PointCloudResult, generate_colored_point_cloud
 from .pose_manager import PoseManager
@@ -39,9 +40,19 @@ class FrameMapStatistics:
     timestamp_seconds: float
     accepted: bool
     reason: str
+    status: str = "rejected"
+    keyframe_reason: str | None = None
+    skip_reason: str | None = None
     rejection_reason: str | None = None
+    depth_inference_executed: bool = False
     good_matches: int = 0
     geometric_inliers: int = 0
+    geometric_inlier_ratio: float = 0.0
+    median_feature_displacement_px: float | None = None
+    p75_feature_displacement_px: float | None = None
+    p90_feature_displacement_px: float | None = None
+    rotation_deg: float | None = None
+    frames_since_last_keyframe: int = 0
     valid_depth_correspondences: int = 0
     pnp_inliers: int = 0
     pnp_inlier_ratio: float = 0.0
@@ -80,6 +91,13 @@ class FrameMapStatistics:
     cloud_points: int = 0
     camera_position: tuple[float, float, float] | None = None
 
+    def __post_init__(self) -> None:
+        valid_statuses = {"accepted_keyframe", "skipped_non_keyframe", "rejected"}
+        if self.status not in valid_statuses:
+            raise ValueError(f"status must be one of {sorted(valid_statuses)}")
+        if self.accepted != (self.status == "accepted_keyframe"):
+            raise ValueError("accepted must match accepted_keyframe status")
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -88,7 +106,9 @@ class FrameMapStatistics:
 class RelativeMapResult:
     sampled_frame_count: int
     accepted_frame_count: int
+    skipped_non_keyframe_count: int
     rejected_frame_count: int
+    depth_inference_count: int
     raw_fused_point_count: int
     voxel_downsampled_point_count: int
     fused_cloud: FusedPointCloud
@@ -103,6 +123,7 @@ class RelativeMapResult:
     is_metric: bool
     scale_mode: str
     translation_units: str
+    keyframes_enabled: bool
 
 
 class RelativeMapBuilder:
@@ -127,6 +148,7 @@ class RelativeMapBuilder:
         min_depth_alignment_inliers: int | None = 500,
         min_depth_alignment_inlier_ratio: float | None = 0.30,
         max_relative_z_p99_over_median: float | None = 50.0,
+        keyframe_selector: KeyframeSelector | None = None,
         depth_pose_estimator: Any | None = None,
         depth_aligner: Callable[..., Any] = align_prediction_to_pose,
         point_cloud_generator: Callable[..., PointCloudResult] = generate_colored_point_cloud,
@@ -166,6 +188,7 @@ class RelativeMapBuilder:
             min_depth_alignment_inlier_ratio=min_depth_alignment_inlier_ratio,
             max_relative_z_p99_over_median=max_relative_z_p99_over_median,
         )
+        self.keyframe_selector = keyframe_selector or KeyframeSelector()
         self.depth_aligner = depth_aligner
         self.point_cloud_generator = point_cloud_generator
 
@@ -241,6 +264,24 @@ class RelativeMapBuilder:
         }
 
     @staticmethod
+    def _keyframe_diagnostics(
+        selection: KeyframeSelectionResult,
+    ) -> dict[str, Any]:
+        metrics = selection.metrics
+        if metrics is None:
+            return {}
+        return {
+            "geometric_inlier_ratio": metrics.geometric_inlier_ratio,
+            "median_feature_displacement_px": (
+                metrics.median_feature_displacement_px
+            ),
+            "p75_feature_displacement_px": metrics.p75_feature_displacement_px,
+            "p90_feature_displacement_px": metrics.p90_feature_displacement_px,
+            "rotation_deg": metrics.rotation_deg,
+            "frames_since_last_keyframe": metrics.frames_since_last_keyframe,
+        }
+
+    @staticmethod
     def _validate_frame(frame: MappingFrame) -> None:
         if (
             not isinstance(frame.image, np.ndarray)
@@ -285,6 +326,9 @@ class RelativeMapBuilder:
             timestamp_seconds=first.timestamp_seconds,
             accepted=True,
             reason="world_origin",
+            status="accepted_keyframe",
+            keyframe_reason="initial_frame",
+            depth_inference_executed=True,
             translation_magnitude=0.0,
             translation_units=first_depth.coordinate_units,
             scale_estimation_method="world_origin",
@@ -296,9 +340,11 @@ class RelativeMapBuilder:
         ))
         previous_accepted = first
         previous_depth = first_depth
+        frames_since_last_keyframe = 0
 
         for frame in iterator:
             sampled_count += 1
+            frames_since_last_keyframe += 1
             self._validate_frame(frame)
             try:
                 matches = self.feature_tracker.match(previous_accepted.image, frame.image)
@@ -306,7 +352,9 @@ class RelativeMapBuilder:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
                     f"feature_matching_failed: {exc}",
+                    status="rejected",
                     rejection_reason="feature_matching",
+                    frames_since_last_keyframe=frames_since_last_keyframe,
                 ))
                 continue
 
@@ -319,8 +367,10 @@ class RelativeMapBuilder:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
                     f"geometric_motion_failed: {exc}",
+                    status="rejected",
                     rejection_reason="geometric_filtering",
                     good_matches=good_matches,
+                    frames_since_last_keyframe=frames_since_last_keyframe,
                 ))
                 continue
             if not geometry_pose.success:
@@ -329,11 +379,54 @@ class RelativeMapBuilder:
                     timestamp_seconds=frame.timestamp_seconds,
                     accepted=False,
                     reason=f"geometric_motion_rejected: {geometry_pose.message}",
+                    status="rejected",
                     rejection_reason="geometric_filtering",
                     good_matches=good_matches,
                     geometric_inliers=geometry_pose.num_inliers,
+                    geometric_inlier_ratio=geometry_pose.inlier_ratio,
+                    frames_since_last_keyframe=frames_since_last_keyframe,
                 ))
                 continue
+
+            assert geometry_pose.rotation is not None
+            selection = self.keyframe_selector.evaluate(
+                points1=matches.points1,
+                points2=matches.points2,
+                inlier_mask=geometry_pose.inlier_mask,
+                rotation=geometry_pose.rotation,
+                good_matches=good_matches,
+                geometric_inliers=geometry_pose.num_inliers,
+                geometric_inlier_ratio=geometry_pose.inlier_ratio,
+                frames_since_last_keyframe=frames_since_last_keyframe,
+            )
+            keyframe_diagnostic = self._keyframe_diagnostics(selection)
+            if selection.status == "rejected":
+                statistics.append(FrameMapStatistics(
+                    frame_index=frame.frame_index,
+                    timestamp_seconds=frame.timestamp_seconds,
+                    accepted=False,
+                    reason=f"keyframe_geometry_rejected: {selection.reason}",
+                    status="rejected",
+                    rejection_reason=selection.reason,
+                    good_matches=good_matches,
+                    geometric_inliers=geometry_pose.num_inliers,
+                    **keyframe_diagnostic,
+                ))
+                continue
+            if selection.status == "skipped":
+                statistics.append(FrameMapStatistics(
+                    frame_index=frame.frame_index,
+                    timestamp_seconds=frame.timestamp_seconds,
+                    accepted=False,
+                    reason=f"skipped_non_keyframe: {selection.reason}",
+                    status="skipped_non_keyframe",
+                    skip_reason=selection.reason,
+                    good_matches=good_matches,
+                    geometric_inliers=geometry_pose.num_inliers,
+                    **keyframe_diagnostic,
+                ))
+                continue
+            keyframe_reason = selection.reason
 
             alignment_inliers = 0
             if self.scale_mode == "depth-pnp":
@@ -351,11 +444,14 @@ class RelativeMapBuilder:
                         frame.timestamp_seconds,
                         False,
                         f"depth_pnp_failed: {exc}",
+                        status="rejected",
+                        keyframe_reason=keyframe_reason,
                         rejection_reason="pnp",
                         good_matches=good_matches,
                         geometric_inliers=geometry_pose.num_inliers,
                         scale_estimation_method="depth_pnp",
                         depth_representation=first_prediction.representation,
+                        **keyframe_diagnostic,
                     ))
                     continue
                 diagnostic = dict(
@@ -370,16 +466,20 @@ class RelativeMapBuilder:
                     translation_units=scaled_pose.translation_units,
                     scale_estimation_method="depth_pnp",
                     depth_representation=first_prediction.representation,
+                    **keyframe_diagnostic,
                 )
                 if not scaled_pose.success:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
                         f"depth_pnp_rejected: {scaled_pose.message}",
+                        status="rejected",
+                        keyframe_reason=keyframe_reason,
                         rejection_reason="pnp",
                         **diagnostic,
                     ))
                     continue
                 try:
+                    depth_inference_executed = True
                     prediction = self._prediction(frame.image)
                     alignment = self.depth_aligner(
                         prediction,
@@ -391,7 +491,10 @@ class RelativeMapBuilder:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
                         f"depth_alignment_failed: {exc}",
+                        status="rejected",
+                        keyframe_reason=keyframe_reason,
                         rejection_reason="depth_alignment",
+                        depth_inference_executed=depth_inference_executed,
                         **diagnostic,
                     ))
                     continue
@@ -399,7 +502,10 @@ class RelativeMapBuilder:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
                         f"depth_alignment_rejected: {alignment.message}",
+                        status="rejected",
+                        keyframe_reason=keyframe_reason,
                         rejection_reason="depth_alignment",
+                        depth_inference_executed=True,
                         depth_alignment_method=alignment.method,
                         depth_alignment_inliers=alignment.inliers,
                         **diagnostic,
@@ -419,7 +525,10 @@ class RelativeMapBuilder:
                         frame.timestamp_seconds,
                         False,
                         f"depth_quality_rejected: {quality_assessment.rejection_reason}",
+                        status="rejected",
+                        keyframe_reason=keyframe_reason,
                         rejection_reason=quality_assessment.rejection_reason,
+                        depth_inference_executed=True,
                         depth_alignment_method=camera_depth.alignment_method,
                         **self._quality_diagnostics(
                             camera_depth, quality_assessment.metrics
@@ -435,6 +544,7 @@ class RelativeMapBuilder:
                 pose_diagnostic = diagnostic
             else:
                 try:
+                    depth_inference_executed = True
                     prediction = self._prediction(frame.image)
                     camera_depth = prediction.to_camera_depth(
                         alignment_method="none",
@@ -444,9 +554,13 @@ class RelativeMapBuilder:
                     statistics.append(FrameMapStatistics(
                         frame.frame_index, frame.timestamp_seconds, False,
                         f"depth_failed: {exc}", good_matches=good_matches,
+                        status="rejected",
+                        keyframe_reason=keyframe_reason,
                         rejection_reason="depth_alignment",
+                        depth_inference_executed=depth_inference_executed,
                         geometric_inliers=geometry_pose.num_inliers,
                         scale_estimation_method="fixed_step_debug",
+                        **keyframe_diagnostic,
                     ))
                     continue
                 rotation = geometry_pose.rotation
@@ -459,6 +573,7 @@ class RelativeMapBuilder:
                     translation_units="arbitrary_fixed_step_units",
                     scale_estimation_method=scale_method,
                     depth_representation=prediction.representation,
+                    **keyframe_diagnostic,
                 )
                 depth_quality = measure_depth_alignment_quality(
                     camera_depth,
@@ -472,7 +587,10 @@ class RelativeMapBuilder:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
                     f"point_cloud_rejected: {exc}",
+                    status="rejected",
+                    keyframe_reason=keyframe_reason,
                     rejection_reason="point_cloud",
+                    depth_inference_executed=True,
                     depth_alignment_method=camera_depth.alignment_method,
                     **self._quality_diagnostics(camera_depth, depth_quality),
                     **pose_diagnostic,
@@ -496,6 +614,9 @@ class RelativeMapBuilder:
                 timestamp_seconds=frame.timestamp_seconds,
                 accepted=True,
                 reason="accepted" if scale_method == "depth_pnp" else "accepted_debug_fixed_step",
+                status="accepted_keyframe",
+                keyframe_reason=keyframe_reason,
+                depth_inference_executed=True,
                 depth_alignment_method=camera_depth.alignment_method,
                 cloud_points=camera_cloud.valid_point_count,
                 camera_position=position,
@@ -506,6 +627,7 @@ class RelativeMapBuilder:
             ))
             previous_accepted = frame
             previous_depth = camera_depth
+            frames_since_last_keyframe = 0
 
         voxelized = fusion.finalize()
         global_filter = filter_global_radius(
@@ -526,11 +648,20 @@ class RelativeMapBuilder:
             ),
         )
         accepted_count = sum(item.accepted for item in statistics)
+        skipped_count = sum(
+            item.status == "skipped_non_keyframe" for item in statistics
+        )
+        rejected_count = sum(item.status == "rejected" for item in statistics)
+        depth_inference_count = sum(
+            item.depth_inference_executed for item in statistics
+        )
         height, width = first.image.shape[:2]
         return RelativeMapResult(
             sampled_frame_count=sampled_count,
             accepted_frame_count=accepted_count,
-            rejected_frame_count=sampled_count - accepted_count,
+            skipped_non_keyframe_count=skipped_count,
+            rejected_frame_count=rejected_count,
+            depth_inference_count=depth_inference_count,
             raw_fused_point_count=fusion.raw_point_count,
             voxel_downsampled_point_count=voxelized.output_point_count,
             fused_cloud=fused,
@@ -549,4 +680,5 @@ class RelativeMapBuilder:
                 if self.scale_mode == "depth-pnp"
                 else "arbitrary_fixed_step_units"
             ),
+            keyframes_enabled=self.keyframe_selector.thresholds.enabled,
         )

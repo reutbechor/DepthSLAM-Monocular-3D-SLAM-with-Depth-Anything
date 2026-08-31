@@ -5,6 +5,7 @@ import numpy as np
 
 from src.depth_alignment import DepthAlignmentResult
 from src.map_builder import MappingFrame, RelativeMapBuilder
+from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.depth_types import CameraDepth, DepthPrediction
 
 
@@ -99,6 +100,25 @@ class RecordingFeatureTracker(FakeFeatureTracker):
         return super().match(first, second)
 
 
+class DisplacementFeatureTracker:
+    def __init__(self, displacements: list[float]) -> None:
+        self.displacements = iter(displacements)
+        self.reference_values: list[int] = []
+
+    def match(self, first: np.ndarray, second: np.ndarray) -> SimpleNamespace:
+        del second
+        self.reference_values.append(int(first[0, 0, 0]))
+        displacement = next(self.displacements)
+        points1 = np.zeros((100, 2), dtype=np.float64)
+        points2 = points1.copy()
+        points2[:, 0] = displacement
+        return SimpleNamespace(
+            points1=points1,
+            points2=points2,
+            statistics=SimpleNamespace(good_matches=100),
+        )
+
+
 class RejectThenAcceptAligner:
     def __init__(self) -> None:
         self.calls = 0
@@ -139,6 +159,32 @@ class RejectThenAcceptAligner:
         )
 
 
+class AlwaysAcceptAligner:
+    def __call__(self, *args, **kwargs) -> DepthAlignmentResult:
+        del args, kwargs
+        depth = CameraDepth(
+            np.ones((2, 2), dtype=np.float32),
+            "relative",
+            False,
+            "relative_camera_z_proxy",
+            "synthetic",
+            "relative_depth_units",
+            "reciprocal_affine_disparity_alignment",
+            "scale_and_shift",
+            disparity_scale=1.0,
+            disparity_shift=0.0,
+            denominator_epsilon=0.001,
+        )
+        return DepthAlignmentResult(
+            True, "synthetic alignment", depth, "scale_and_shift",
+            1000, 600, 1.0, 0.0, 0.0,
+        )
+
+
+def disabled_keyframes() -> KeyframeSelector:
+    return KeyframeSelector(KeyframeThresholds(enabled=False))
+
+
 class MapBuilderTests(unittest.TestCase):
     @staticmethod
     def frame(index: int) -> MappingFrame:
@@ -162,6 +208,7 @@ class MapBuilderTests(unittest.TestCase):
             feature_tracker=FakeFeatureTracker(),
             motion_estimator=RejectingMotionEstimator(),
             camera_matrix=np.eye(3),
+            keyframe_selector=disabled_keyframes(),
             point_cloud_stride=1,
             voxel_size=0.1,
         )
@@ -202,6 +249,7 @@ class MapBuilderTests(unittest.TestCase):
             motion_estimator=SuccessfulGeometryEstimator(),
             depth_pose_estimator=RejectingDepthPoseEstimator(),
             camera_matrix=np.eye(3),
+            keyframe_selector=disabled_keyframes(),
             point_cloud_stride=1,
             voxel_size=0.1,
         )
@@ -221,6 +269,7 @@ class MapBuilderTests(unittest.TestCase):
             feature_tracker=FakeFeatureTracker(),
             motion_estimator=SuccessfulGeometryEstimator(),
             camera_matrix=np.eye(3),
+            keyframe_selector=disabled_keyframes(),
             scale_mode="fixed-step",
             translation_step=0.5,
             point_cloud_stride=1,
@@ -246,6 +295,7 @@ class MapBuilderTests(unittest.TestCase):
             depth_pose_estimator=SuccessfulDepthPoseEstimator(),
             depth_aligner=aligner,
             camera_matrix=np.eye(3),
+            keyframe_selector=disabled_keyframes(),
             point_cloud_stride=1,
             voxel_size=0.1,
         )
@@ -257,6 +307,7 @@ class MapBuilderTests(unittest.TestCase):
         ])
 
         self.assertEqual(result.accepted_frame_count, 2)
+        self.assertEqual(result.skipped_non_keyframe_count, 0)
         self.assertEqual(result.rejected_frame_count, 1)
         self.assertEqual(result.raw_fused_point_count, 8)
         np.testing.assert_array_equal(result.trajectory_frame_indices, [0, 2])
@@ -269,7 +320,76 @@ class MapBuilderTests(unittest.TestCase):
             result.frame_statistics[1].to_dict()["rejection_reason"],
             "depth_denominator_reject_ratio",
         )
+        self.assertEqual(result.frame_statistics[1].status, "rejected")
         self.assertTrue(result.frame_statistics[2].accepted)
+
+    def test_skipped_frame_avoids_depth_and_preserves_keyframe_reference(self) -> None:
+        depth = FakeDepthEstimator()
+        tracker = DisplacementFeatureTracker([1.0, 10.0])
+        builder = RelativeMapBuilder(
+            depth_estimator=depth,
+            feature_tracker=tracker,
+            motion_estimator=SuccessfulGeometryEstimator(),
+            depth_pose_estimator=SuccessfulDepthPoseEstimator(),
+            depth_aligner=AlwaysAcceptAligner(),
+            camera_matrix=np.eye(3),
+            point_cloud_stride=1,
+            voxel_size=0.1,
+        )
+
+        result = builder.build([
+            self.marked_frame(0),
+            self.marked_frame(1),
+            self.marked_frame(2),
+        ])
+
+        self.assertEqual(result.accepted_frame_count, 2)
+        self.assertEqual(result.skipped_non_keyframe_count, 1)
+        self.assertEqual(result.rejected_frame_count, 0)
+        self.assertEqual(result.depth_inference_count, 2)
+        self.assertEqual(depth.calls, 2)
+        self.assertEqual(tracker.reference_values, [0, 0])
+        self.assertEqual(result.raw_fused_point_count, 8)
+        np.testing.assert_array_equal(result.trajectory_frame_indices, [0, 2])
+        skipped = result.frame_statistics[1]
+        accepted = result.frame_statistics[2]
+        self.assertEqual(skipped.status, "skipped_non_keyframe")
+        self.assertEqual(skipped.skip_reason, "insufficient_keyframe_motion")
+        self.assertEqual(
+            skipped.to_dict()["status"], "skipped_non_keyframe"
+        )
+        self.assertFalse(skipped.depth_inference_executed)
+        self.assertEqual(accepted.status, "accepted_keyframe")
+        self.assertEqual(
+            accepted.keyframe_reason, "sufficient_feature_displacement"
+        )
+        self.assertTrue(accepted.depth_inference_executed)
+        self.assertEqual(accepted.pnp_inliers, 8)
+
+    def test_disabled_keyframes_reproduces_fixed_sample_attempt(self) -> None:
+        depth = FakeDepthEstimator()
+        tracker = DisplacementFeatureTracker([0.0])
+        builder = RelativeMapBuilder(
+            depth_estimator=depth,
+            feature_tracker=tracker,
+            motion_estimator=SuccessfulGeometryEstimator(),
+            depth_pose_estimator=SuccessfulDepthPoseEstimator(),
+            depth_aligner=AlwaysAcceptAligner(),
+            keyframe_selector=disabled_keyframes(),
+            camera_matrix=np.eye(3),
+            point_cloud_stride=1,
+            voxel_size=0.1,
+        )
+
+        result = builder.build([self.marked_frame(0), self.marked_frame(1)])
+
+        self.assertEqual(result.accepted_frame_count, 2)
+        self.assertEqual(result.skipped_non_keyframe_count, 0)
+        self.assertEqual(result.depth_inference_count, 2)
+        self.assertEqual(
+            result.frame_statistics[1].keyframe_reason,
+            "keyframe_selection_disabled",
+        )
 
 
 if __name__ == "__main__":

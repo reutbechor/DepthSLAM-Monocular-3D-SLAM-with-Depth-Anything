@@ -22,6 +22,17 @@ motion:
   minimum_inliers: 8
   minimum_inlier_ratio: 0.25
 
+keyframes:
+  # Stage 6 selects visually informative candidates before depth inference.
+  enabled: true
+  min_good_matches: 100
+  min_geometric_inliers: 80
+  min_geometric_inlier_ratio: 0.40
+  # Pixel displacement is an image-space heuristic, not physical translation.
+  min_median_feature_displacement_px: 8.0
+  min_rotation_deg: 1.0
+  max_frames_without_keyframe: 30
+
 depth_geometry:
   sampling_method: bilinear
 
@@ -34,7 +45,7 @@ point_cloud:
   depth_percentile_high: 99.0
 
 map:
-  # Mapping frames are simple samples, not loop-closure-aware keyframes.
+  # These are candidate samples; Stage 6 decides which become keyframes.
   sample_every: 10
   max_mapping_frames: 5
   # Preferred path estimates translation magnitude from relative camera Z + PnP.

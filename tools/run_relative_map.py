@@ -23,6 +23,7 @@ except ModuleNotFoundError as exc:
 
 from src.depth_estimator import DEFAULT_MODEL, DepthEstimator
 from src.depth_pose_estimator import DepthPoseEstimator
+from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
 from src.ply_io import write_ascii_ply
 from src.video_loader import VideoLoader
@@ -42,7 +43,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cx", type=float, help="Calibrated principal point x (pixels)")
     parser.add_argument("--cy", type=float, help="Calibrated principal point y (pixels)")
     parser.add_argument("--sample-every", type=int, metavar="N")
-    parser.add_argument("--max-mapping-frames", type=int)
+    parser.add_argument(
+        "--max-mapping-frames", "--max-candidate-frames",
+        dest="max_mapping_frames", type=int,
+        help="Maximum sampled candidate frames to consider",
+    )
+    parser.add_argument(
+        "--keyframes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable Stage 6 visual keyframe selection",
+    )
+    parser.add_argument(
+        "--kf-min-displacement", type=float,
+        help="Minimum median geometric-inlier displacement in pixels",
+    )
+    parser.add_argument(
+        "--kf-min-rotation-deg", type=float,
+        help="Minimum recovered rotation magnitude in degrees",
+    )
+    parser.add_argument(
+        "--kf-max-gap", type=int,
+        help="Force a keyframe attempt after this many candidates",
+    )
     parser.add_argument(
         "--scale-mode", choices=("depth-pnp", "fixed-step"),
         help="depth-pnp is reconstruction mode; fixed-step is arbitrary debug mode",
@@ -234,12 +257,15 @@ def main() -> int:
         config = load_config(args.config)
         model_config = config.get("model", {})
         motion_config = config.get("motion", {})
+        keyframe_config = config.get("keyframes", {})
         map_config = config.get("map", {})
         output_config = config.get("output", {})
         if not all(isinstance(section, dict) for section in (
-            model_config, motion_config, map_config, output_config
+            model_config, motion_config, keyframe_config, map_config, output_config
         )):
-            raise ValueError("model, motion, map, and output config sections must be mappings")
+            raise ValueError(
+                "model, motion, keyframes, map, and output config sections must be mappings"
+            )
         camera_matrix = camera_matrix_from_args(args, config)
 
         sample_every = int(setting(args.sample_every, map_config, "sample_every", 10))
@@ -299,6 +325,39 @@ def main() -> int:
             "max_relative_z_p99_over_median",
             50.0,
         )
+        keyframes_enabled = (
+            args.keyframes
+            if args.keyframes is not None
+            else keyframe_config.get("enabled", True)
+        )
+        keyframe_thresholds = KeyframeThresholds(
+            enabled=keyframes_enabled,
+            min_good_matches=keyframe_config.get("min_good_matches", 100),
+            min_geometric_inliers=keyframe_config.get(
+                "min_geometric_inliers", 80
+            ),
+            min_geometric_inlier_ratio=keyframe_config.get(
+                "min_geometric_inlier_ratio", 0.40
+            ),
+            min_median_feature_displacement_px=setting(
+                args.kf_min_displacement,
+                keyframe_config,
+                "min_median_feature_displacement_px",
+                8.0,
+            ),
+            min_rotation_deg=setting(
+                args.kf_min_rotation_deg,
+                keyframe_config,
+                "min_rotation_deg",
+                1.0,
+            ),
+            max_frames_without_keyframe=setting(
+                args.kf_max_gap,
+                keyframe_config,
+                "max_frames_without_keyframe",
+                30,
+            ),
+        )
         if sample_every < 1 or maximum < 1 or cloud_stride < 1:
             raise ValueError("sampling, maximum frame count, and cloud stride must be positive")
 
@@ -332,6 +391,7 @@ def main() -> int:
             min_depth_alignment_inliers=min_depth_alignment_inliers,
             min_depth_alignment_inlier_ratio=min_depth_alignment_inlier_ratio,
             max_relative_z_p99_over_median=max_relative_z_p99_over_median,
+            keyframe_selector=KeyframeSelector(keyframe_thresholds),
             depth_pose_estimator=DepthPoseEstimator(
                 minimum_correspondences=int(map_config.get(
                     "minimum_pnp_correspondences", 6
@@ -355,7 +415,11 @@ def main() -> int:
         output_root = args.output_dir or Path(output_config.get("directory", "outputs"))
         run_directory = create_output_directory(output_root / "relative_map", args.video)
         metadata = {
-            "map_type": "relative_multi_frame",
+            "map_type": (
+                "relative_keyframe_map"
+                if keyframe_thresholds.enabled
+                else "relative_fixed_sample_map"
+            ),
             **scientific_metadata(result, scale_mode, translation_step),
             "source": str(args.video.resolve()),
             "source_fps": source_fps,
@@ -373,6 +437,21 @@ def main() -> int:
             "max_mapping_frames": maximum,
             "point_cloud_stride": cloud_stride,
             "voxel_size": voxel_size,
+            "keyframe_selection": {
+                "enabled": keyframe_thresholds.enabled,
+                "min_good_matches": keyframe_thresholds.min_good_matches,
+                "min_geometric_inliers": keyframe_thresholds.min_geometric_inliers,
+                "min_geometric_inlier_ratio": (
+                    keyframe_thresholds.min_geometric_inlier_ratio
+                ),
+                "min_median_feature_displacement_px": (
+                    keyframe_thresholds.min_median_feature_displacement_px
+                ),
+                "min_rotation_deg": keyframe_thresholds.min_rotation_deg,
+                "max_frames_without_keyframe": (
+                    keyframe_thresholds.max_frames_without_keyframe
+                ),
+            },
             "depth_quality_thresholds": {
                 "min_valid_depth_ratio": min_valid_depth_ratio,
                 "max_denominator_reject_ratio": max_denominator_reject_ratio,
@@ -385,8 +464,12 @@ def main() -> int:
                 ),
             },
             "sampled_frames": result.sampled_frame_count,
+            "total_candidate_frames": result.sampled_frame_count,
             "accepted_frames": result.accepted_frame_count,
+            "accepted_keyframes": result.accepted_frame_count,
+            "skipped_non_keyframes": result.skipped_non_keyframe_count,
             "rejected_frames": result.rejected_frame_count,
+            "depth_inference_count": result.depth_inference_count,
             "rejection_reason_counts": {
                 reason: sum(
                     item.rejection_reason == reason
@@ -402,7 +485,10 @@ def main() -> int:
             "initial_map_point_count": result.raw_fused_point_count,
             "final_map_point_count": result.fused_cloud.output_point_count,
             **robustness_metadata(result),
-            "trajectory_format": "accepted frames only; rejected frames are in frame_stats.jsonl",
+            "trajectory_format": (
+                "accepted keyframes only; skipped and rejected candidates are in "
+                "frame_stats.jsonl"
+            ),
             "note": (
                 "Relative-mode map uses propagated reciprocal-disparity units, not metres."
                 if not result.is_metric
@@ -413,8 +499,10 @@ def main() -> int:
 
         print("Relative multi-frame map completed")
         print(f"Sampled frames: {result.sampled_frame_count}")
-        print(f"Accepted mapping frames: {result.accepted_frame_count}")
+        print(f"Accepted keyframes: {result.accepted_frame_count}")
+        print(f"Skipped non-keyframes: {result.skipped_non_keyframe_count}")
         print(f"Rejected frames: {result.rejected_frame_count}")
+        print(f"Depth inference count: {result.depth_inference_count}")
         print(f"Raw fused points: {result.raw_fused_point_count}")
         print(f"After voxel downsampling: {result.voxel_downsampled_point_count}")
         print(
@@ -423,29 +511,23 @@ def main() -> int:
         )
         print(f"Final map points: {result.fused_cloud.output_point_count}")
         print(f"Relative trajectory poses: {result.trajectory_positions.shape[0]}")
-        for item in result.frame_statistics[1:]:
-            if item.accepted:
-                if item.scale_estimation_method == "depth_pnp":
-                    print(
-                        f"Frame {item.frame_index}: t={item.translation_magnitude:.6f} "
-                        f"{item.translation_units}, PnP inliers={item.pnp_inliers}, "
-                        f"RMSE={item.reprojection_rmse_pixels:.3f}px, "
-                        f"depth alignment={item.depth_alignment_method}"
-                    )
-                else:
-                    print(
-                        f"Frame {item.frame_index}: debug fixed step="
-                        f"{item.translation_magnitude:.6f}"
-                    )
-            else:
-                print(f"Frame {item.frame_index}: rejected ({item.reason})")
         for item in result.frame_statistics:
-            status = "accepted" if item.accepted else "rejected"
-            rejection = item.rejection_reason or "none"
+            if item.status == "rejected":
+                decision_reason = item.rejection_reason or item.reason
+            elif item.status == "skipped_non_keyframe":
+                decision_reason = item.skip_reason or item.reason
+            else:
+                decision_reason = item.keyframe_reason or item.reason
             print(
-                f"Frame {item.frame_index} quality: {status}, "
-                f"rejection={rejection}, PnP inliers={item.pnp_inliers}, "
-                f"RMSE={item.reprojection_rmse_pixels}, "
+                f"Frame {item.frame_index}: status={item.status}, "
+                f"matches={item.good_matches}, geometric inliers="
+                f"{item.geometric_inliers}, geometric ratio="
+                f"{item.geometric_inlier_ratio:.6f}, median displacement="
+                f"{item.median_feature_displacement_px}, rotation="
+                f"{item.rotation_deg}, reason={decision_reason}, "
+                f"depth inference={item.depth_inference_executed}, "
+                f"PnP inliers={item.pnp_inliers}, RMSE={item.reprojection_rmse_pixels}, "
+                f"translation={item.translation_magnitude}, "
                 f"denominator reject ratio={item.denominator_rejection_ratio:.6f}, "
                 f"valid depth ratio={item.valid_aligned_depth_ratio:.6f}, "
                 f"alignment inliers={item.depth_alignment_inliers}, "

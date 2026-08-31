@@ -31,6 +31,11 @@ the first camera's world frame, and voxel-downsamples them into one relative
 map. Its new components and small end-to-end CPU run are validated; details are
 in the Stage 5 section below.
 
+Stage 6 adds visual keyframe selection before candidate depth inference and map
+fusion. It preserves every Stage 5 reliability gate and is validated on a
+30-candidate CPU run. It is a selection layer, not loop closure or global map
+optimization.
+
 ## Depth Anything and this project
 
 [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) is a
@@ -377,7 +382,7 @@ sampled RGB frames
     -> scaled relative R,t and sequential pose accumulation
     -> current-frame affine disparity scale/shift alignment
     -> reject non-finite or numerically unsafe disparity denominators
-    -> pre-filter depth-alignment quality gate (accept or skip frame)
+    -> pre-filter depth-alignment quality gate (accept or reject frame)
     -> dense colored relative point cloud
     -> optional relative-Z percentile tail suppression
     -> camera cloud transformed into the common world frame
@@ -510,15 +515,15 @@ outputs/relative_map/relative_map_<source>_<timestamp>/
 |-- global_relative_map.ply       # ASCII x y z red green blue
 |-- global_points_relative.npy    # finite Nx3 relative map coordinates
 |-- global_colors_rgb.npy         # matching Nx3 uint8 RGB colors
-|-- trajectory_relative.csv       # accepted frames only
+|-- trajectory_relative.csv       # accepted keyframes only
 |-- trajectory_relative.npy       # accepted camera positions, Nx3
 |-- frame_stats.jsonl             # frame status, Z/alignment/filter diagnostics
 `-- metadata.json                 # parameters, raw/filter counts, global statistics
 ```
 
-The trajectory CSV includes accepted frames only; rejected frames are retained
-in `frame_stats.jsonl`. Metadata explicitly records
-`map_type: relative_multi_frame`, `is_metric: false`, `depth_type: relative`,
+The trajectory CSV includes accepted keyframes only; skipped and rejected
+candidates are retained in `frame_stats.jsonl`. Metadata explicitly records
+the keyframe mode, `is_metric: false`, `depth_type: relative`,
 `scale_estimation_method: depth_pnp`, `translation_step: null`, and
 `depth_alignment_method: scale_and_shift_per_accepted_pair`.
 
@@ -563,6 +568,84 @@ them changes the scientific acceptance policy and should be justified for the
 dataset; the implementation does not silently tune them merely to produce more
 accepted or rejected frames.
 
+## Stage 6: visual keyframe selection
+
+A keyframe is a candidate image selected to contribute a pose and dense cloud
+to the mapped trajectory. Mapping every sampled frame can add nearly duplicate
+geometry and unnecessary depth inference, so Stage 6 first compares each
+candidate against the last accepted keyframe using information already
+available from feature matching and Essential-Matrix geometry:
+
+```text
+sampled candidate
+    -> match against last accepted keyframe
+    -> Essential Matrix and geometric inliers
+    -> keyframe selector
+       -> skip redundant candidate before depth inference, or
+       -> attempt the unchanged Stage 5 PnP/depth/quality/fusion pipeline
+```
+
+The first valid frame is always an `accepted_keyframe` with reason
+`initial_frame`. Later candidates must first satisfy configurable minimum good
+matches, geometric inliers, and geometric-inlier ratio. A reliable candidate is
+selected when its median geometric-inlier pixel displacement reaches the
+configured threshold, its recovered rotation reaches the rotation threshold,
+or the maximum candidate gap forces an attempt. The forced-gap rule does not
+bypass PnP or depth-quality validation.
+
+Pixel displacement is computed as the median of
+`sqrt((u2-u1)^2 + (v2-v1)^2)` over geometric inliers; p75 and p90 are diagnostic
+only. It is an image-space heuristic whose meaning depends on image resolution,
+scene depth, motion, and camera. Essential-Matrix translation magnitude is not
+used as distance because monocular translation scale is unknown.
+
+Frame states are intentionally distinct:
+
+- `accepted_keyframe`: passed selection and the complete Stage 5 pipeline.
+- `skipped_non_keyframe`: reliable visual geometry but insufficient new motion;
+  no depth inference, pose, cloud, or reference update occurs.
+- `rejected`: feature/geometry, PnP, alignment, depth-quality, or cloud
+  reliability failed.
+
+Both skipped and rejected candidates remain compared against the last accepted
+keyframe on the next attempt. Metadata records the state, decision reason,
+matches, geometric statistics, median/p75/p90 displacement, rotation, candidate
+gap, depth-execution flag, and downstream diagnostics when executed.
+
+Defaults are under `keyframes:` in `config/default.yaml`. Selection is enabled
+by default. Use `--no-keyframes` to reproduce Stage 5 fixed-sample attempts as
+closely as possible, or override the compact CLI controls:
+
+```powershell
+py tools\run_relative_map.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 5 --max-candidate-frames 30 --point-cloud-stride 8 --device cpu --keyframes
+
+py tools\run_relative_map.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 5 --max-candidate-frames 30 --point-cloud-stride 8 --device cpu --no-keyframes
+```
+
+### Stage 6 validated run and Stage 5 comparison
+
+The keyframe-enabled command above was executed on Windows, Python 3.13.5, and
+CPU. Of 30 candidates, 13 became accepted keyframes, 17 were rejected, and none
+were skipped for insufficient keyframe motion. Fourteen candidates executed
+Depth Anything: the 13 accepted keyframes plus frame 145, which was rejected by
+the existing `depth_z_distribution` gate. The remaining 16 candidates failed
+Essential-Matrix pose reliability before selection or depth inference. The map
+contained 154,138 raw fused points, 34,184 voxelized points, and 34,013 final
+points.
+
+The matching `--no-keyframes` comparison was also executed. It produced the
+same 30 candidates, 14 depth calls, 13 accepted frames, and 34,013 final points.
+On this particular video, every geometrically reliable candidate already had
+median displacement above 8 px, while lower-motion candidates failed geometric
+pose recovery first. Therefore this validation demonstrates correct selection
+and accounting but does not demonstrate a runtime or depth-call reduction. No
+runtime improvement is claimed.
+
+Keyframe selection does not resolve scale ambiguity, make depth metric, remove
+sequential drift, provide loop closure, guarantee optimal map coverage, or
+replace bundle adjustment. Its thresholds are dataset- and resolution-dependent
+heuristics for computational and mapping selection.
+
 For a focused two-frame report, run:
 
 ```powershell
@@ -601,7 +684,8 @@ DJI aerial footage.
 - Outlier filtering does not replace bundle adjustment or loop closure.
 - There is no loop closure, bundle adjustment, pose graph optimization, global
   relocalization, IMU/GNSS fusion, GUI, or ground-truth evaluation.
-- Mapping-frame selection is fixed sampling, not sophisticated keyframe logic.
+- Stage 6 keyframe decisions use heuristic image motion and may skip useful
+  geometry or retain redundant views when thresholds are poorly chosen.
 - Stage 2 accepts two still frames; it is not a full-video motion or SLAM tool.
 - Stage 3 points remain local to the Frame 1 camera and use relative depth units.
 - Stage 4 exports a single-camera relative PLY; Stage 5 fuses multiple clouds

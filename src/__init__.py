@@ -14,6 +14,14 @@ from .depth_geometry import DepthGeometryProcessor
 from .feature_tracker import FeatureTracker
 from .map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
 from .map_fusion import FusedPointCloud, RelativeMapFusion, voxel_downsample
+from .keyframe_selector import (
+    KeyframeMotionMetrics,
+    KeyframeSelectionResult,
+    KeyframeSelector,
+    KeyframeThresholds,
+    feature_displacement_statistics,
+    rotation_angle_degrees,
+)
 from .motion_estimator import MotionEstimator
 from .point_cloud import PointCloudResult, generate_colored_point_cloud
 from .pose_manager import PoseManager
@@ -45,6 +53,12 @@ __all__ = [
     "FusedPointCloud",
     "RelativeMapFusion",
     "voxel_downsample",
+    "KeyframeMotionMetrics",
+    "KeyframeSelectionResult",
+    "KeyframeSelector",
+    "KeyframeThresholds",
+    "feature_displacement_statistics",
+    "rotation_angle_degrees",
     "MotionEstimator",
     "PointCloudResult",
     "generate_colored_point_cloud",
