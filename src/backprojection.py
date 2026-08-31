@@ -1,4 +1,4 @@
-"""Pinhole backprojection from pixels and relative depth to camera-frame 3D."""
+"""Pinhole backprojection from pixels and positive camera Z to camera-frame 3D."""
 
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ def validate_camera_matrix(camera_matrix: np.ndarray) -> np.ndarray:
 
 
 def backproject_pixels(
-    pixels: np.ndarray, depths: np.ndarray, camera_matrix: np.ndarray
+    pixels: np.ndarray, camera_depths: np.ndarray, camera_matrix: np.ndarray
 ) -> np.ndarray:
-    """Backproject Nx2 pixels into Nx3 points in relative depth units.
+    """Backproject Nx2 pixels and genuine positive Z-like values into Nx3 points.
 
-    The resulting coordinates are in the input depth map's relative units, not
-    metres. Invalid depths are rejected rather than replaced.
+    This low-level function does not convert raw model output. Callers must pass
+    camera-axis Z values whose metric/relative semantics are already known.
     """
     pixel_array = np.asarray(pixels, dtype=np.float64)
     if pixel_array.ndim != 2 or pixel_array.shape[1:] != (2,):
@@ -33,15 +33,15 @@ def backproject_pixels(
     if not np.isfinite(pixel_array).all():
         raise ValueError("pixels must contain only finite values")
 
-    depth_array = np.asarray(depths, dtype=np.float64)
+    depth_array = np.asarray(camera_depths, dtype=np.float64)
     if depth_array.ndim == 2 and depth_array.shape[1:] == (1,):
         depth_array = depth_array[:, 0]
     if depth_array.ndim != 1:
-        raise ValueError("depths must be an N or Nx1 array")
+        raise ValueError("camera_depths must be an N or Nx1 array")
     if depth_array.shape[0] != pixel_array.shape[0]:
-        raise ValueError("pixels and depths must contain the same number of samples")
+        raise ValueError("pixels and camera_depths must contain the same number of samples")
     if not np.isfinite(depth_array).all() or np.any(depth_array <= 0):
-        raise ValueError("depths must contain only finite, positive values")
+        raise ValueError("camera_depths must contain only finite, positive values")
 
     intrinsics = validate_camera_matrix(camera_matrix)
     if pixel_array.shape[0] == 0:

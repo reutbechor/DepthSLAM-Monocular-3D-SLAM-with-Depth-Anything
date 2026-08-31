@@ -1,4 +1,4 @@
-"""CLI for a short-video incremental map in arbitrary relative units."""
+"""CLI for depth-scaled short-video incremental relative mapping."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from src.depth_estimator import DEFAULT_MODEL, DepthEstimator
+from src.depth_pose_estimator import DepthPoseEstimator
 from src.map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
 from src.ply_io import write_ascii_ply
 from src.video_loader import VideoLoader
@@ -31,7 +32,7 @@ from tools.run_motion import camera_matrix_from_args, load_config
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a short multi-frame map in arbitrary relative units",
+        description="Build a depth-scaled short multi-frame map",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("video", type=Path, help="Input video")
@@ -42,7 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cy", type=float, help="Calibrated principal point y (pixels)")
     parser.add_argument("--sample-every", type=int, metavar="N")
     parser.add_argument("--max-mapping-frames", type=int)
-    parser.add_argument("--translation-step", type=float)
+    parser.add_argument(
+        "--scale-mode", choices=("depth-pnp", "fixed-step"),
+        help="depth-pnp is reconstruction mode; fixed-step is arbitrary debug mode",
+    )
+    parser.add_argument(
+        "--translation-step", type=float,
+        help="Arbitrary magnitude used only with --scale-mode fixed-step",
+    )
     parser.add_argument("--point-cloud-stride", type=int)
     parser.add_argument("--voxel-size", type=float)
     parser.add_argument("--model", help="Hugging Face Depth Anything model ID")
@@ -54,6 +62,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ransac-threshold", type=float, metavar="PIXELS")
     parser.add_argument("--minimum-inliers", type=int)
     parser.add_argument("--minimum-inlier-ratio", type=float)
+    parser.add_argument("--pnp-reprojection-error", type=float, metavar="PIXELS")
+    parser.add_argument("--minimum-pnp-inliers", type=int)
+    parser.add_argument("--minimum-pnp-inlier-ratio", type=float)
     parser.add_argument("--output-dir", type=Path, help="Root for generated outputs")
     return parser.parse_args()
 
@@ -127,6 +138,38 @@ def save_outputs(
     return ply_path
 
 
+def scientific_metadata(
+    result: RelativeMapResult, scale_mode: str, translation_step: float
+) -> dict[str, Any]:
+    """Return the scientific labels shared by saved metadata and tests."""
+    return {
+        "is_metric": result.is_metric,
+        "depth_type": result.depth_type,
+        "depth_representation": result.depth_representation,
+        "geometry_depth_representation": (
+            "camera_z" if result.is_metric else "relative_camera_z_proxy"
+        ),
+        "scale_mode": scale_mode,
+        "scale_estimation_method": (
+            "depth_pnp" if scale_mode == "depth-pnp" else "fixed_step_debug"
+        ),
+        "translation_scale": (
+            "depth_assisted_pnp" if scale_mode == "depth-pnp"
+            else "arbitrary_fixed_step_debug"
+        ),
+        "translation_step": translation_step if scale_mode == "fixed-step" else None,
+        "translation_units": result.translation_units,
+        "depth_alignment_method": (
+            "metric_model" if result.is_metric
+            else "scale_and_shift_per_accepted_pair"
+            if scale_mode == "depth-pnp"
+            else "none"
+        ),
+        "coordinate_units": result.translation_units,
+        "voxel_units": result.translation_units,
+    }
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -150,6 +193,7 @@ def main() -> int:
         translation_step = float(setting(
             args.translation_step, map_config, "translation_step", 1.0
         ))
+        scale_mode = setting(args.scale_mode, map_config, "scale_mode", "depth-pnp")
         cloud_stride = int(setting(
             args.point_cloud_stride, map_config, "point_cloud_stride", 6
         ))
@@ -174,9 +218,27 @@ def main() -> int:
             feature_tracker=build_tracker(args, motion_config),
             motion_estimator=build_motion_estimator(args, motion_config),
             camera_matrix=camera_matrix,
+            scale_mode=scale_mode,
             translation_step=translation_step,
             point_cloud_stride=cloud_stride,
             voxel_size=voxel_size,
+            depth_pose_estimator=DepthPoseEstimator(
+                minimum_correspondences=int(map_config.get(
+                    "minimum_pnp_correspondences", 6
+                )),
+                minimum_inliers=int(setting(
+                    args.minimum_pnp_inliers, map_config,
+                    "minimum_pnp_inliers", 6,
+                )),
+                minimum_inlier_ratio=float(setting(
+                    args.minimum_pnp_inlier_ratio, map_config,
+                    "minimum_pnp_inlier_ratio", 0.25,
+                )),
+                reprojection_error_pixels=float(setting(
+                    args.pnp_reprojection_error, map_config,
+                    "pnp_reprojection_error_pixels", 3.0,
+                )),
+            ),
         )
         result = builder.build(selected_frames)
 
@@ -184,12 +246,7 @@ def main() -> int:
         run_directory = create_output_directory(output_root / "relative_map", args.video)
         metadata = {
             "map_type": "relative_multi_frame",
-            "is_metric": False,
-            "depth_type": "relative",
-            "translation_scale": "arbitrary_relative_step",
-            "translation_step": translation_step,
-            "coordinate_units": "relative_map_units",
-            "voxel_units": "relative_map_units",
+            **scientific_metadata(result, scale_mode, translation_step),
             "source": str(args.video.resolve()),
             "source_fps": source_fps,
             "image_width": result.image_width,
@@ -213,7 +270,11 @@ def main() -> int:
             "initial_map_point_count": result.raw_fused_point_count,
             "final_map_point_count": result.fused_cloud.output_point_count,
             "trajectory_format": "accepted frames only; rejected frames are in frame_stats.jsonl",
-            "note": "Map coordinates are arbitrary relative units, not metres.",
+            "note": (
+                "Relative-mode map uses propagated reciprocal-disparity units, not metres."
+                if not result.is_metric
+                else "Metric-mode values remain subject to model and calibration error."
+            ),
         }
         ply_path = save_outputs(run_directory, result, metadata)
 
@@ -224,11 +285,33 @@ def main() -> int:
         print(f"Raw fused points: {result.raw_fused_point_count}")
         print(f"Downsampled map points: {result.fused_cloud.output_point_count}")
         print(f"Relative trajectory poses: {result.trajectory_positions.shape[0]}")
-        print("WARNING: Map coordinates use arbitrary relative units. The map is NOT metric.")
+        for item in result.frame_statistics[1:]:
+            if item.accepted:
+                if item.scale_estimation_method == "depth_pnp":
+                    print(
+                        f"Frame {item.frame_index}: t={item.translation_magnitude:.6f} "
+                        f"{item.translation_units}, PnP inliers={item.pnp_inliers}, "
+                        f"RMSE={item.reprojection_rmse_pixels:.3f}px, "
+                        f"depth alignment={item.depth_alignment_method}"
+                    )
+                else:
+                    print(
+                        f"Frame {item.frame_index}: debug fixed step="
+                        f"{item.translation_magnitude:.6f}"
+                    )
+            else:
+                print(f"Frame {item.frame_index}: rejected ({item.reason})")
+        if scale_mode == "fixed-step":
+            print("WARNING: fixed-step is an arbitrary DEBUG mode, not reconstruction.")
+        if not result.is_metric:
+            print(
+                "WARNING: Translation and map coordinates use relative depth units, "
+                "not metres."
+            )
         print(f"Final map: {ply_path.resolve()}")
         print(f"Outputs: {run_directory.resolve()}")
         return 0
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
         print(f"Relative map failed: {exc}", file=sys.stderr)
         return 1
 

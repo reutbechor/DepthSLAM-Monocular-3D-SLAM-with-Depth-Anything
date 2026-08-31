@@ -115,16 +115,18 @@ def write_image(path: Path, image: np.ndarray) -> None:
 
 def save_outputs(
     directory: Path,
-    depth: np.ndarray,
+    raw_prediction: np.ndarray,
+    camera_z: np.ndarray,
     match_image: np.ndarray,
     geometry: Any,
     metadata: dict[str, Any],
 ) -> None:
-    np.save(directory / "depth_raw.npy", depth.astype(np.float32, copy=False))
+    np.save(directory / "depth_raw.npy", raw_prediction.astype(np.float32, copy=False))
+    np.save(directory / "camera_z.npy", camera_z.astype(np.float32, copy=False))
     np.save(directory / "feature_points_2d.npy", geometry.valid_pixel_coordinates)
-    np.save(directory / "feature_depths.npy", geometry.sampled_relative_depths)
+    np.save(directory / "feature_depths.npy", geometry.sampled_camera_depths)
     np.save(directory / "points_3d_relative.npy", geometry.points_3d_relative)
-    write_image(directory / "depth_vis.png", colorize_depth(depth))
+    write_image(directory / "depth_vis.png", colorize_depth(raw_prediction))
     write_image(directory / "matches.png", match_image)
     with (directory / "metadata.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
@@ -155,12 +157,15 @@ def main() -> int:
 
         model_name = args.model or model_config.get("name", DEFAULT_MODEL)
         device = args.device or model_config.get("device", "auto")
-        print(f"Loading {model_name} on {device} for Frame 1 relative depth...")
+        print(f"Loading {model_name} on {device} for Frame 1 depth prediction...")
         depth_estimator = DepthEstimator(model_name=model_name, device=device)
-        relative_depth = depth_estimator.predict(image1)
+        prediction = depth_estimator.predict_result(image1)
+        camera_depth = prediction.to_camera_depth(
+            alignment_method="metric_model" if prediction.is_metric else "none"
+        )
         sampling = args.sampling or geometry_config.get("sampling_method", "bilinear")
         geometry = DepthGeometryProcessor(sampling).process(
-            matches.points1, pose.inlier_mask, relative_depth, camera_matrix
+            matches.points1, pose.inlier_mask, camera_depth, camera_matrix
         )
 
         output_root = args.output_dir or Path(output_config.get("directory", "outputs"))
@@ -193,15 +198,30 @@ def main() -> int:
             "valid_depth_samples": geometry.valid_depth_sample_count,
             "relative_3d_points": geometry.points_3d_relative.shape[0],
             "depth_sampling": geometry.sampling_method,
-            "depth_type": "relative",
+            "depth_type": prediction.depth_type,
+            "raw_depth_representation": prediction.representation,
+            "geometry_depth_representation": camera_depth.representation,
+            "depth_conversion": camera_depth.conversion,
+            "is_metric": prediction.is_metric,
             "coordinate_frame": "frame1_camera",
-            "coordinate_units": "relative_depth_units",
+            "coordinate_units": camera_depth.coordinate_units,
             "translation_scale": "unknown",
-            "note": "3D coordinates are relative and must not be interpreted as metres.",
+            "note": (
+                "3D coordinates use a reciprocal relative-depth proxy, not metres."
+                if not prediction.is_metric
+                else "3D coordinates use model-predicted metric depth."
+            ),
             "rotation": pose.rotation.tolist(),
             "translation_direction": pose.translation_direction.reshape(-1).tolist(),
         }
-        save_outputs(run_directory, relative_depth, match_image, geometry, metadata)
+        save_outputs(
+            run_directory,
+            prediction.values,
+            camera_depth.values,
+            match_image,
+            geometry,
+            metadata,
+        )
 
         if geometry.valid_depth_sample_count == 0:
             print("Depth-assisted relative geometry failed: no valid depth samples")
@@ -210,7 +230,7 @@ def main() -> int:
         print_match_report(matches.statistics)
         print(f"Pose inliers: {pose.num_inliers}")
         print(f"Inlier ratio: {pose.inlier_ratio:.3f}")
-        print(f"Valid relative-depth samples: {geometry.valid_depth_sample_count}")
+        print(f"Valid camera-Z samples: {geometry.valid_depth_sample_count}")
         print(f"Relative 3D points: {geometry.points_3d_relative.shape[0]}")
         print("\nRotation R:")
         print(np.array2string(pose.rotation, precision=6, suppress_small=True))
@@ -218,7 +238,11 @@ def main() -> int:
         print(np.array2string(
             pose.translation_direction, precision=6, suppress_small=True
         ))
-        print("\nWARNING: 3D coordinates use relative Depth Anything units and are NOT metric.")
+        if not prediction.is_metric:
+            print(
+                "\nWARNING: raw output is disparity-like. 3D coordinates use a "
+                "reciprocal relative-Z proxy and are NOT metric."
+            )
         print(f"Outputs: {run_directory.resolve()}")
         return 0 if geometry.valid_depth_sample_count > 0 else 1
     except (FeatureTrackingError, FileNotFoundError, RuntimeError, ValueError) as exc:

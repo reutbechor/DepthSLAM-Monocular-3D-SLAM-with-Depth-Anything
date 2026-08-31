@@ -33,8 +33,14 @@ map:
   # Mapping frames are simple samples, not loop-closure-aware keyframes.
   sample_every: 10
   max_mapping_frames: 5
-  # Arbitrary relative map step; this is not metres or recovered metric scale.
+  # Preferred path estimates translation magnitude from relative camera Z + PnP.
+  scale_mode: depth-pnp
+  # Used only when scale_mode is explicitly changed to fixed-step debug mode.
   translation_step: 1.0
+  minimum_pnp_correspondences: 6
+  minimum_pnp_inliers: 6
+  minimum_pnp_inlier_ratio: 0.25
+  pnp_reprojection_error_pixels: 3.0
   point_cloud_stride: 6
   # Voxel size is expressed in relative map units, not metres.
   voxel_size: 0.05

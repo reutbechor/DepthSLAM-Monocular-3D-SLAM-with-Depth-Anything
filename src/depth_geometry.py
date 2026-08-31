@@ -1,4 +1,4 @@
-"""Sample relative depth at pose inliers and create relative 3D geometry."""
+"""Sample explicit camera Z at pose inliers and create camera-frame geometry."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .backprojection import backproject_pixels, validate_camera_matrix
+from .depth_types import CameraDepth
 
 
 @dataclass(frozen=True)
@@ -17,11 +18,19 @@ class DepthGeometryResult:
     pose_inlier_count: int
     valid_depth_sample_count: int
     valid_pixel_coordinates: np.ndarray
-    sampled_relative_depths: np.ndarray
+    sampled_camera_depths: np.ndarray
     points_3d_relative: np.ndarray
     valid_match_indices: np.ndarray
     valid_match_mask: np.ndarray
     sampling_method: str
+    depth_type: str
+    depth_representation: str
+    coordinate_units: str
+
+    @property
+    def sampled_relative_depths(self) -> np.ndarray:
+        """Compatibility alias for earlier relative-only callers."""
+        return self.sampled_camera_depths
 
 
 class DepthGeometryProcessor:
@@ -36,7 +45,7 @@ class DepthGeometryProcessor:
     def _validate_inputs(
         matched_points: np.ndarray,
         pose_inlier_mask: np.ndarray,
-        relative_depth_map: np.ndarray,
+        camera_depth: CameraDepth,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         points = np.asarray(matched_points, dtype=np.float64)
         if points.ndim != 2 or points.shape[1:] != (2,):
@@ -44,9 +53,13 @@ class DepthGeometryProcessor:
         mask = np.asarray(pose_inlier_mask, dtype=bool).reshape(-1)
         if mask.shape[0] != points.shape[0]:
             raise ValueError("pose_inlier_mask length must equal matched point count")
-        depth = np.asarray(relative_depth_map)
+        if not isinstance(camera_depth, CameraDepth):
+            raise TypeError(
+                "camera_depth must be a CameraDepth; raw model predictions are not Z"
+            )
+        depth = np.asarray(camera_depth.values)
         if depth.ndim != 2 or depth.size == 0 or not np.issubdtype(depth.dtype, np.number):
-            raise ValueError("relative_depth_map must be a non-empty numeric HxW array")
+            raise ValueError("camera_depth values must be a non-empty numeric HxW array")
         return points, mask, depth.astype(np.float64, copy=False)
 
     @staticmethod
@@ -110,12 +123,12 @@ class DepthGeometryProcessor:
         self,
         matched_points: np.ndarray,
         pose_inlier_mask: np.ndarray,
-        relative_depth_map: np.ndarray,
+        camera_depth: CameraDepth,
         camera_matrix: np.ndarray,
     ) -> DepthGeometryResult:
         """Filter, sample, and backproject Frame 1 matches in relative units."""
         points, pose_mask, depth = self._validate_inputs(
-            matched_points, pose_inlier_mask, relative_depth_map
+            matched_points, pose_inlier_mask, camera_depth
         )
         intrinsics = validate_camera_matrix(camera_matrix)
         pose_indices = np.flatnonzero(pose_mask)
@@ -137,9 +150,12 @@ class DepthGeometryProcessor:
             pose_inlier_count=int(np.count_nonzero(pose_mask)),
             valid_depth_sample_count=valid_depths.shape[0],
             valid_pixel_coordinates=valid_pixels,
-            sampled_relative_depths=valid_depths,
+            sampled_camera_depths=valid_depths,
             points_3d_relative=points_3d,
             valid_match_indices=valid_indices,
             valid_match_mask=original_mask,
             sampling_method=self.sampling_method,
+            depth_type=camera_depth.depth_type,
+            depth_representation=camera_depth.representation,
+            coordinate_units=camera_depth.coordinate_units,
         )

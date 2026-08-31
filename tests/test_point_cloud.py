@@ -3,6 +3,16 @@ import unittest
 import numpy as np
 
 from src.point_cloud import generate_colored_point_cloud
+from src.depth_types import CameraDepth
+
+
+def camera_depth(values: np.ndarray) -> CameraDepth:
+    clean = np.asarray(values, dtype=np.float32).copy()
+    clean[~np.isfinite(clean) | (clean <= 0.0)] = np.nan
+    return CameraDepth(
+        clean, "relative", False, "relative_camera_z_proxy", "synthetic",
+        "relative_depth_units", "synthetic", "none",
+    )
 
 
 class PointCloudTests(unittest.TestCase):
@@ -16,7 +26,9 @@ class PointCloudTests(unittest.TestCase):
         )
         depth = np.array([[1.0, 2.0], [3.0, 4.0]])
 
-        result = generate_colored_point_cloud(image_rgb, depth, np.eye(3))
+        result = generate_colored_point_cloud(
+            image_rgb, camera_depth(depth), np.eye(3)
+        )
 
         expected_points = np.array(
             [[0.0, 0.0, 1.0], [2.0, 0.0, 2.0],
@@ -34,7 +46,9 @@ class PointCloudTests(unittest.TestCase):
         image = np.zeros((8, 8, 3), dtype=np.uint8)
         depth = np.ones((8, 8), dtype=np.float32)
 
-        result = generate_colored_point_cloud(image, depth, np.eye(3), stride=2)
+        result = generate_colored_point_cloud(
+            image, camera_depth(depth), np.eye(3), stride=2
+        )
 
         self.assertEqual(result.sampled_pixel_count, 16)
         self.assertEqual(result.valid_point_count, 16)
@@ -44,7 +58,7 @@ class PointCloudTests(unittest.TestCase):
         image = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
         depth = np.array([[1.0, np.nan, 0.0], [np.inf, -1.0, 2.0]])
 
-        result = generate_colored_point_cloud(image, depth, np.eye(3))
+        result = generate_colored_point_cloud(image, camera_depth(depth), np.eye(3))
 
         self.assertEqual(result.sampled_pixel_count, 6)
         self.assertEqual(result.valid_point_count, 2)

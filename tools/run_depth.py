@@ -80,7 +80,16 @@ def metadata(source: Path, index: int, seconds: float, image: np.ndarray,
         "source_path": str(source.resolve()), "frame_index": index,
         "timestamp_seconds": round(seconds, 6), "frame_width": width,
         "frame_height": height, "model": estimator.model_name,
-        "device": estimator.device, "depth_type": "relative",
+        "device": estimator.device,
+        "depth_type": estimator.depth_type,
+        "is_metric": estimator.is_metric,
+        "representation": estimator.representation,
+        "geometry_ready": estimator.is_metric,
+        "note": (
+            "Relative raw values are disparity-like and are not camera Z."
+            if not estimator.is_metric
+            else "Metric model output represents model-predicted camera depth."
+        ),
     }
 
 

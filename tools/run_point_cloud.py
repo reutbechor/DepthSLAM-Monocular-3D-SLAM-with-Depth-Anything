@@ -22,6 +22,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from src.depth_estimator import DEFAULT_MODEL, DepthEstimator
+from src.depth_types import CameraDepth, DepthPrediction
 from src.ply_io import write_ascii_ply
 from src.point_cloud import PointCloudResult, generate_colored_point_cloud
 from src.visualization import colorize_depth
@@ -60,14 +61,19 @@ def write_image(path: Path, image: np.ndarray) -> None:
 
 def save_outputs(
     directory: Path,
-    depth: np.ndarray,
+    prediction: DepthPrediction,
+    camera_depth: CameraDepth,
     cloud: PointCloudResult,
     metadata: dict[str, Any],
 ) -> Path:
-    np.save(directory / "depth_raw.npy", depth.astype(np.float32, copy=False))
+    np.save(directory / "depth_raw.npy", prediction.values.astype(np.float32, copy=False))
+    np.save(
+        directory / "camera_z.npy",
+        camera_depth.values.astype(np.float32, copy=False),
+    )
     np.save(directory / "points_3d_relative.npy", cloud.points)
     np.save(directory / "colors_rgb.npy", cloud.colors)
-    write_image(directory / "depth_vis.png", colorize_depth(depth))
+    write_image(directory / "depth_vis.png", colorize_depth(prediction.values))
     ply_path = write_ascii_ply(
         directory / "cloud_relative.ply", cloud.points, cloud.colors
     )
@@ -95,11 +101,14 @@ def main() -> int:
 
         model_name = args.model or model_config.get("name", DEFAULT_MODEL)
         device = args.device or model_config.get("device", "auto")
-        print(f"Loading {model_name} on {device} for relative depth...")
+        print(f"Loading {model_name} on {device}...")
         estimator = DepthEstimator(model_name=model_name, device=device)
-        relative_depth = estimator.predict(image_bgr)
+        prediction = estimator.predict_result(image_bgr)
+        camera_depth = prediction.to_camera_depth(
+            alignment_method="metric_model" if prediction.is_metric else "none"
+        )
         cloud = generate_colored_point_cloud(
-            image_rgb, relative_depth, camera_matrix, stride=stride
+            image_rgb, camera_depth, camera_matrix, stride=stride
         )
 
         output_root = args.output_dir or Path(output_config.get("directory", "outputs"))
@@ -123,13 +132,32 @@ def main() -> int:
             "stride": cloud.stride,
             "sampled_pixel_count": cloud.sampled_pixel_count,
             "valid_point_count": cloud.valid_point_count,
-            "depth_type": "relative",
+            "depth_type": prediction.depth_type,
+            "raw_depth_representation": prediction.representation,
+            "geometry_depth_representation": camera_depth.representation,
+            "depth_conversion": camera_depth.conversion,
+            "depth_alignment_method": camera_depth.alignment_method,
             "coordinate_frame": cloud.coordinate_frame,
             "coordinate_units": cloud.coordinate_units,
-            "is_metric": False,
-            "note": "Point coordinates use relative depth units and are not metres.",
+            "is_metric": prediction.is_metric,
+            "z_statistics": {
+                name: float(value) for name, value in zip(
+                    ("min", "p05", "median", "p95", "max"),
+                    np.percentile(
+                        camera_depth.values[np.isfinite(camera_depth.values)],
+                        (0, 5, 50, 95, 100),
+                    ),
+                )
+            },
+            "note": (
+                "Relative coordinates are reciprocal disparity proxies, not metres."
+                if not prediction.is_metric
+                else "Metric values are model predictions and remain subject to model error."
+            ),
         }
-        ply_path = save_outputs(run_directory, relative_depth, cloud, metadata)
+        ply_path = save_outputs(
+            run_directory, prediction, camera_depth, cloud, metadata
+        )
 
         if cloud.valid_point_count == 0:
             print("Point cloud generation failed: no valid relative-depth points")
@@ -141,7 +169,17 @@ def main() -> int:
         print(f"Valid points: {cloud.valid_point_count}")
         print(f"Points shape: {cloud.points.shape}")
         print(f"RGB colors shape: {cloud.colors.shape}")
-        print("WARNING: Point coordinates use relative Depth Anything units and are NOT metric.")
+        valid_z = camera_depth.values[np.isfinite(camera_depth.values)]
+        percentiles = np.percentile(valid_z, (0, 5, 50, 95, 100))
+        print(
+            "Camera Z statistics (min/p05/median/p95/max): "
+            + ", ".join(f"{value:.6f}" for value in percentiles)
+        )
+        if not prediction.is_metric:
+            print(
+                "WARNING: raw relative output is disparity-like; camera Z is a "
+                "reciprocal proxy in relative units, NOT metres."
+            )
         print(f"PLY: {ply_path.resolve()}")
         print(f"Outputs: {run_directory.resolve()}")
         return 0 if cloud.valid_point_count > 0 else 1

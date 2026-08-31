@@ -1,6 +1,8 @@
 """Reusable depth inference, relative geometry, and transform components."""
 
 from .depth_estimator import DepthEstimator
+from .depth_pose_estimator import DepthPoseEstimateResult, DepthPoseEstimator
+from .depth_types import CameraDepth, DepthPrediction
 from .depth_geometry import DepthGeometryProcessor
 from .feature_tracker import FeatureTracker
 from .map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
@@ -12,6 +14,10 @@ from .transforms import invert_transform, make_transform, transform_points
 
 __all__ = [
     "DepthEstimator",
+    "DepthPoseEstimateResult",
+    "DepthPoseEstimator",
+    "CameraDepth",
+    "DepthPrediction",
     "DepthGeometryProcessor",
     "FeatureTracker",
     "MappingFrame",

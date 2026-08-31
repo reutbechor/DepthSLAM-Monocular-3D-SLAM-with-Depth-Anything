@@ -3,6 +3,16 @@ import unittest
 import numpy as np
 
 from src.depth_geometry import DepthGeometryProcessor
+from src.depth_types import CameraDepth
+
+
+def camera_depth(values: np.ndarray) -> CameraDepth:
+    clean = np.asarray(values, dtype=np.float32).copy()
+    clean[~np.isfinite(clean) | (clean <= 0.0)] = np.nan
+    return CameraDepth(
+        clean, "relative", False, "relative_camera_z_proxy", "synthetic",
+        "relative_depth_units", "synthetic", "none",
+    )
 
 
 class DepthGeometryTests(unittest.TestCase):
@@ -10,7 +20,7 @@ class DepthGeometryTests(unittest.TestCase):
         depth = np.array([[1.0, 2.0], [3.0, 5.0]])
         pixels = np.array([[0.5, 0.5]])
         result = DepthGeometryProcessor("bilinear").process(
-            pixels, np.array([True]), depth, np.eye(3)
+            pixels, np.array([True]), camera_depth(depth), np.eye(3)
         )
 
         self.assertEqual(result.original_match_count, 1)
@@ -36,7 +46,7 @@ class DepthGeometryTests(unittest.TestCase):
         pose_mask = np.array([True, True, True, True, False])
 
         result = DepthGeometryProcessor("nearest").process(
-            pixels, pose_mask, depth, np.eye(3)
+            pixels, pose_mask, camera_depth(depth), np.eye(3)
         )
 
         self.assertEqual(result.original_match_count, 5)

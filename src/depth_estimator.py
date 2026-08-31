@@ -7,6 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .depth_types import DepthPrediction
 from .visualization import colorize_depth
 
 DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
@@ -39,6 +40,16 @@ class DepthEstimator:
                 "connection, or ensure its weights are in the Hugging Face cache."
             ) from exc
         self.model.to(self.device).eval()
+        depth_type = getattr(self.model.config, "depth_estimation_type", None)
+        if depth_type not in {"relative", "metric"}:
+            raise RuntimeError(
+                "The loaded model does not declare a supported depth_estimation_type"
+            )
+        self.depth_type = depth_type
+        self.is_metric = depth_type == "metric"
+        self.representation = (
+            "metric_depth" if self.is_metric else "relative_inverse_depth"
+        )
 
     @staticmethod
     def _resolve_device(requested: str, torch_module: Any) -> str:
@@ -54,8 +65,8 @@ class DepthEstimator:
             raise ValueError("device must be one of: auto, cpu, cuda")
         return requested
 
-    def predict(self, image: np.ndarray) -> np.ndarray:
-        """Return an HxW float32 relative-depth map for a BGR image."""
+    def predict_result(self, image: np.ndarray) -> DepthPrediction:
+        """Return a typed raw model prediction for an OpenCV BGR image."""
         if not isinstance(image, np.ndarray) or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("image must be an HxWx3 NumPy array in OpenCV BGR format")
 
@@ -71,8 +82,24 @@ class DepthEstimator:
                 mode="bicubic",
                 align_corners=False,
             )
-        return resized.squeeze().cpu().numpy().astype(np.float32)
+        values = resized.squeeze().cpu().numpy().astype(np.float32)
+        return DepthPrediction(
+            values=values,
+            depth_type=self.depth_type,
+            is_metric=self.is_metric,
+            representation=self.representation,
+            model_name=self.model_name,
+        )
+
+    def predict(self, image: np.ndarray) -> np.ndarray:
+        """Return raw model values for backward-compatible Stage 1 callers.
+
+        For the default relative model these values are disparity-like, not
+        camera Z. Geometry code must use ``predict_result`` and an explicit
+        conversion to ``CameraDepth``.
+        """
+        return self.predict_result(image).values
 
     def predict_visualization(self, image: np.ndarray) -> np.ndarray:
         """Return a colorized BGR visualization of relative depth."""
-        return colorize_depth(self.predict(image))
+        return colorize_depth(self.predict_result(image).values)
