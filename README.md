@@ -12,9 +12,14 @@ work. Video validation with `--sample-every 10` successfully processed 17
 sampled frames. The expected RGB, raw depth, visualization, comparison, and
 metadata outputs were created.
 
-The Stage 2 two-frame motion module is implemented and covered by offline unit
-and synthetic-geometry tests. A real-pair pose run still requires calibrated
-intrinsics for the camera that captured those frames.
+The Stage 2 two-frame motion module is implemented, covered by offline unit and
+synthetic-geometry tests, and exercised on the calibrated local frame pair used
+for Stage 3 validation.
+
+Stage 3 connects Frame 1 relative depth to pose-inlier features and produces a
+small set of relative 3D points in the Frame 1 camera coordinate system. It does
+not create or accumulate a map. The integrated CPU run was validated on
+`data/frame1.jpg` and `data/frame2.jpg` with the documented intrinsics.
 
 This status applies only to Stage 1 depth estimation; it does not imply that a
 3D SLAM pipeline has been implemented or validated.
@@ -209,6 +214,74 @@ fails.
 Stage 2 is visual motion estimation between two frames only. It does not
 accumulate a trajectory and is not a full SLAM system.
 
+## Stage 3: depth-assisted relative 3D geometry
+
+The three implemented stages now connect as follows:
+
+```text
+Stage 1: RGB frame -> Depth Anything relative depth
+Stage 2: two RGB frames -> relative R and unknown-scale t direction
+Stage 3: pose-inlier Frame 1 pixels + relative depth + camera intrinsics
+         -> relative Frame 1 camera-frame 3D points
+```
+
+Stage 3 samples Frame 1's relative depth at feature matches accepted by Stage
+2's pose geometry. It then backprojects every valid sample with the calibrated
+pinhole model:
+
+```text
+X = (u - cx) * Z / fx
+Y = (v - cy) * Z / fy
+Z = relative depth
+```
+
+Pixels outside the depth image and samples with `NaN`, infinity, zero, or
+negative depth are removed. No replacement depth is invented. Bilinear sampling
+is the default; nearest-neighbor sampling is also available.
+
+Because Depth Anything V2 Small produces **relative depth**, `X`, `Y`, and `Z`
+are in `relative_depth_units`, not metres. Stage 3 does not recover monocular
+metric scale, and the Stage 2 translation remains an unknown-scale direction.
+
+### Run the integrated pipeline
+
+Provide calibration values measured for the source camera:
+
+```powershell
+py tools\run_depth_geometry.py data\frame1.jpg data\frame2.jpg --fx 730 --fy 730 --cx 636 --cy 321
+```
+
+The validated CPU run produced 5,604 good matches, 5,357 pose inliers, 5,357
+valid relative-depth samples, and 5,357 relative 3D points. These counts describe
+relative geometry only and do not indicate metric reconstruction.
+
+This command reuses `FeatureTracker`, `MotionEstimator`, and `DepthEstimator`;
+the depth sampling and backprojection code never loads a model itself. Use
+`--sampling nearest` to override bilinear sampling, or inspect all options with:
+
+```powershell
+py tools\run_depth_geometry.py --help
+```
+
+Each invocation creates a timestamped directory:
+
+```text
+outputs/depth_geometry/depth_geometry_<frame1>_<frame2>_<timestamp>/
+|-- depth_raw.npy
+|-- depth_vis.png
+|-- matches.png
+|-- feature_points_2d.npy
+|-- feature_depths.npy
+|-- points_3d_relative.npy
+`-- metadata.json
+```
+
+`metadata.json` explicitly records `depth_type: relative`,
+`coordinate_units: relative_depth_units`, the intrinsics and counts, and that
+translation scale is unknown. No global point cloud or PLY file is produced.
+
+Stage 3 creates relative two-frame geometry only. It is not a global SLAM map.
+
 ## Current limitations
 
 - Depth is relative and uncalibrated, not metric.
@@ -217,6 +290,7 @@ accumulate a trajectory and is not a full SLAM system.
   pipeline, map fusion, keyframe handling, loop closure, bundle adjustment,
   point-cloud generation, GUI, or evaluation.
 - Stage 2 accepts two still frames; it is not a full-video motion or SLAM tool.
+- Stage 3 points remain local to the Frame 1 camera and use relative depth units.
 - CPU inference is supported but can be slow.
 - Transformers output can differ slightly from the original repository's
   OpenCV preprocessing/upsampling path, as the official authors note.

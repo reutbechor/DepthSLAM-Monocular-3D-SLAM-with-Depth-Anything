@@ -7,7 +7,7 @@ video:
   sample_every_n_frames: 1
 
 camera:
-  # Supply calibrated pixel intrinsics here or through run_motion.py arguments.
+  # Supply calibrated intrinsics here or through the motion/geometry CLI arguments.
   fx: null
   fy: null
   cx: null
@@ -21,6 +21,9 @@ motion:
   ransac_threshold_pixels: 1.0
   minimum_inliers: 8
   minimum_inlier_ratio: 0.25
+
+depth_geometry:
+  sampling_method: bilinear
 
 output:
   directory: outputs
