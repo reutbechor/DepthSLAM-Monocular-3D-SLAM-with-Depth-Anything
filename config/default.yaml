@@ -81,5 +81,19 @@ trajectory_refinement:
   # Position-only local average; rotations are never averaged element-wise.
   moving_average_weights: [0.25, 0.50, 0.25]
 
+visual_output:
+  # Presentation artifacts are enabled by default and never replace raw data.
+  save_previews: true
+  save_display_clean: true
+  # Conservative, deterministic display-only point-cloud filtering.
+  display_z_percentile_min: 1.0
+  display_z_percentile_max: 99.0
+  display_center_distance_percentile: 99.5
+  display_center_mad_multiplier: 6.0
+  # Set both Z percentiles or the center-distance percentile to null to disable.
+  # Plotting is deterministically subsampled; exported PLY files are not.
+  preview_max_points: 40000
+  overview_max_points: 20000
+
 output:
   directory: outputs

@@ -109,6 +109,18 @@ def _write_mapping_run(root: Path, source: Path, *, complete: bool = True) -> Pa
         (run / "global_relative_map.ply").write_text(
             "ply\nformat ascii 1.0\nend_header\n", encoding="ascii"
         )
+        for name in (
+            "global_relative_map_raw.ply",
+            "global_relative_map_display.ply",
+            "global_map_preview_front.png",
+            "global_map_preview_oblique.png",
+            "global_map_preview_top.png",
+            "trajectory_xz.png",
+            "trajectory_xy.png",
+            "trajectory_3d.png",
+            "map_overview_panel.png",
+        ):
+            (run / name).write_bytes(b"fixture")
     return run
 
 
@@ -204,6 +216,14 @@ def test_artifact_references_exist_and_evaluation_paths_are_correct(
     assert evaluation["frame_metrics_csv"] == "evaluation/frame_metrics.csv"
     assert evaluation["summary_json"] == "evaluation/summary.json"
     assert evaluation["evaluation_report"] == "evaluation/evaluation_report.txt"
+    mapping = result["artifact_index"]["mapping"]
+    assert mapping["global_relative_map_raw_ply"].endswith(
+        "global_relative_map_raw.ply"
+    )
+    assert mapping["global_relative_map_display_ply"].endswith(
+        "global_relative_map_display.ply"
+    )
+    assert mapping["map_overview_panel"].endswith("map_overview_panel.png")
 
 
 def test_missing_required_mapping_artifact_fails_clearly(

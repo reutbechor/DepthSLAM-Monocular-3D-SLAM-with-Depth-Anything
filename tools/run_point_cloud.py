@@ -23,8 +23,13 @@ except ModuleNotFoundError as exc:
 
 from src.depth_estimator import DEFAULT_MODEL, DepthEstimator
 from src.depth_types import CameraDepth, DepthPrediction
-from src.ply_io import write_ascii_ply
 from src.point_cloud import PointCloudResult, generate_colored_point_cloud
+from src.visual_outputs import (
+    CloudVisualArtifacts,
+    display_cleaning_metadata,
+    save_cloud_visual_artifacts,
+    save_rgb_depth_side_by_side,
+)
 from src.visualization import colorize_depth
 from tools.run_motion import camera_matrix_from_args, load_config, load_image
 
@@ -55,6 +60,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", help="Hugging Face Depth Anything model ID")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
+    parser.add_argument(
+        "--save-previews",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save front, oblique, and top PNG previews",
+    )
+    parser.add_argument(
+        "--save-display-clean",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save a conservatively cleaned display-only PLY",
+    )
     parser.add_argument("--output-dir", type=Path, help="Root for generated outputs")
     return parser.parse_args()
 
@@ -77,7 +94,12 @@ def save_outputs(
     camera_depth: CameraDepth,
     cloud: PointCloudResult,
     metadata: dict[str, Any],
-) -> Path:
+    image_bgr: np.ndarray,
+    visual_config: dict[str, Any],
+    *,
+    save_previews: bool,
+    save_display_clean: bool,
+) -> tuple[Path, CloudVisualArtifacts]:
     np.save(directory / "depth_raw.npy", prediction.values.astype(np.float32, copy=False))
     np.save(
         directory / "camera_z.npy",
@@ -85,13 +107,56 @@ def save_outputs(
     )
     np.save(directory / "points_3d_relative.npy", cloud.points)
     np.save(directory / "colors_rgb.npy", cloud.colors)
-    write_image(directory / "depth_vis.png", colorize_depth(prediction.values))
-    ply_path = write_ascii_ply(
-        directory / "cloud_relative.ply", cloud.points, cloud.colors
+    write_image(directory / "rgb_input.png", image_bgr)
+    depth_visualization = colorize_depth(prediction.values)
+    write_image(directory / "depth_vis.png", depth_visualization)
+    save_rgb_depth_side_by_side(
+        directory / "rgb_depth_side_by_side.png", image_bgr, depth_visualization
     )
+    z_low = visual_config.get("display_z_percentile_min", 1.0)
+    z_high = visual_config.get("display_z_percentile_max", 99.0)
+    if (z_low is None) != (z_high is None):
+        raise ValueError("both display Z percentiles must be set or null")
+    z_percentiles = (
+        None if z_low is None else (float(z_low), float(z_high))
+    )
+    center_percentile = visual_config.get(
+        "display_center_distance_percentile", 99.5
+    )
+    artifacts = save_cloud_visual_artifacts(
+        directory,
+        cloud.points,
+        cloud.colors,
+        raw_filenames=("cloud_relative.ply", "cloud_relative_raw.ply"),
+        display_filename="cloud_relative_display.ply",
+        preview_prefix="point_cloud_preview",
+        title="Single-frame relative point cloud (display only, non-metric)",
+        save_display_clean=save_display_clean,
+        save_previews=save_previews,
+        z_percentiles=z_percentiles,
+        center_distance_percentile=(
+            None if center_percentile is None else float(center_percentile)
+        ),
+        center_mad_multiplier=float(
+            visual_config.get("display_center_mad_multiplier", 6.0)
+        ),
+        preview_max_points=int(visual_config.get("preview_max_points", 40_000)),
+    )
+    metadata["visual_output"] = display_cleaning_metadata(
+        artifacts.cleaning,
+        raw_artifact="cloud_relative_raw.ply",
+        compatibility_artifact="cloud_relative.ply",
+        display_artifact=(
+            "cloud_relative_display.ply" if save_display_clean else None
+        ),
+    )
+    metadata["visual_output"].update({
+        "previews_saved": save_previews,
+        "display_clean_saved": save_display_clean,
+    })
     with (directory / "metadata.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
-    return ply_path
+    return artifacts.raw_paths[0], artifacts
 
 
 def main() -> int:
@@ -100,11 +165,15 @@ def main() -> int:
         config = load_config(args.config)
         model_config = config.get("model", {})
         cloud_config = config.get("point_cloud", {})
+        visual_config = config.get("visual_output", {})
         output_config = config.get("output", {})
         if not all(isinstance(section, dict) for section in (
-            model_config, cloud_config, output_config
+            model_config, cloud_config, visual_config, output_config
         )):
-            raise ValueError("model, point_cloud, and output config sections must be mappings")
+            raise ValueError(
+                "model, point_cloud, visual_output, and output config sections "
+                "must be mappings"
+            )
 
         camera_matrix = camera_matrix_from_args(args, config)
         image_bgr = load_image(args.image, "input image")
@@ -124,6 +193,16 @@ def main() -> int:
             args.depth_percentile_high
             if args.depth_percentile_high is not None
             else cloud_config.get("depth_percentile_high", 99.0)
+        )
+        save_previews = bool(
+            args.save_previews
+            if args.save_previews is not None
+            else visual_config.get("save_previews", True)
+        )
+        save_display_clean = bool(
+            args.save_display_clean
+            if args.save_display_clean is not None
+            else visual_config.get("save_display_clean", True)
         )
 
         model_name = args.model or model_config.get("name", DEFAULT_MODEL)
@@ -205,8 +284,16 @@ def main() -> int:
                 else "Metric values are model predictions and remain subject to model error."
             ),
         }
-        ply_path = save_outputs(
-            run_directory, prediction, camera_depth, cloud, metadata
+        ply_path, visual_artifacts = save_outputs(
+            run_directory,
+            prediction,
+            camera_depth,
+            cloud,
+            metadata,
+            image_bgr,
+            visual_config,
+            save_previews=save_previews,
+            save_display_clean=save_display_clean,
         )
 
         if cloud.valid_point_count == 0:
@@ -245,6 +332,12 @@ def main() -> int:
                 "reciprocal proxy in relative units, NOT metres."
             )
         print(f"PLY: {ply_path.resolve()}")
+        print(
+            "Display cleaning (presentation only): "
+            f"{visual_artifacts.cleaning.raw_count} raw -> "
+            f"{visual_artifacts.cleaning.display_count} displayed "
+            f"({visual_artifacts.cleaning.removed_count} removed)"
+        )
         print(f"Outputs: {run_directory.resolve()}")
         return 0 if cloud.valid_point_count > 0 else 1
     except (FileNotFoundError, RuntimeError, ValueError) as exc:

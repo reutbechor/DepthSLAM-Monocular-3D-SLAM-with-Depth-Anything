@@ -120,8 +120,53 @@ poses. Observed wall times were 100.878 seconds for mapping, 0.950 seconds for
 evaluation, 0.226 seconds for refinement, and 102.152 seconds end-to-end. The
 mapping time includes blocked Hugging Face network checks before the cached
 checkpoint loaded, so these values are environment-specific observations, not
-benchmarks. The artifact index verified 28 referenced files. The full suite
-passed with **93 tests and 4 subtests**, and `run_pipeline.py --help` passed.
+benchmarks. The artifact index verified 28 referenced files. After the visual
+output enhancement, the full suite passed with **100 tests and 4 subtests**;
+the point-cloud, relative-map, and final-pipeline CLI help commands also passed.
+
+## Visual outputs and how to inspect them
+
+The point-cloud and mapping commands now save presentation-ready PNGs and a
+separate, conservatively cleaned PLY by default. These outputs are for visual
+inspection and reports only: they do not feed back into depth inference,
+camera-pose estimation, keyframe selection, fusion, evaluation, or trajectory
+refinement.
+
+The distinction between the files is intentional:
+
+- `*_raw.ply` is the preserved scientific map produced by the existing
+  pipeline. The older `cloud_relative.ply` and `global_relative_map.ply` names
+  remain byte-equivalent backward-compatible raw exports.
+- `*_display.ply` is a display-only copy. It removes non-finite samples, the
+  configured Z-percentile tails, and only extreme distances from the median 3D
+  center using a conservative percentile plus median/MAD radius.
+- `*_preview_*.png`, trajectory plots, and `map_overview_panel.png` are
+  deterministic Matplotlib renderings of relative geometry. Their axes and
+  titles say `relative` and `non-metric`; they must not be read as metres or as
+  evidence of absolute accuracy. A visually cleaner preview does not imply
+  perfect geometry.
+- `metadata.json` records raw, displayed, and removed point counts plus the
+  display thresholds. Raw `.npy` geometry and all prior diagnostic files remain
+  unchanged.
+
+A practical inspection order is:
+
+1. Open `rgb_input.png`, then `depth_vis.png`.
+2. Open `rgb_depth_side_by_side.png` for the combined relative-depth view.
+3. Open `point_cloud_preview_oblique.png` for the single-frame cloud.
+4. For a map run, open `map_overview_panel.png`, then
+   `global_map_preview_oblique.png` and `trajectory_xz.png`.
+5. Compare the other fixed views and trajectory projections if needed.
+6. Open `*_display.ply` in MeshLab or another PLY viewer for a cleaner
+   interactive view.
+7. Use `*_raw.ply`, the `.npy` files, and metadata for scientific inspection
+   and reproducible downstream analysis.
+
+`visual_output:` in `config/default.yaml` contains the display percentiles,
+MAD multiplier, and deterministic plotting limits. `--save-previews` and
+`--save-display-clean` are enabled by default; either can be disabled with
+`--no-save-previews` or `--no-save-display-clean`. Disabling them changes only
+presentation artifacts.
 
 ## Depth Anything and this project
 
@@ -433,12 +478,19 @@ The output is timestamped:
 
 ```text
 outputs/point_cloud/point_cloud_<frame>_<timestamp>/
+|-- rgb_input.png
 |-- depth_raw.npy
 |-- camera_z.npy
 |-- depth_vis.png
+|-- rgb_depth_side_by_side.png
 |-- points_3d_relative.npy
 |-- colors_rgb.npy
-|-- cloud_relative.ply
+|-- cloud_relative.ply             # backward-compatible raw scientific PLY
+|-- cloud_relative_raw.ply         # explicit raw scientific PLY
+|-- cloud_relative_display.ply     # presentation-only cleaned PLY
+|-- point_cloud_preview_front.png
+|-- point_cloud_preview_oblique.png
+|-- point_cloud_preview_top.png
 `-- metadata.json
 ```
 
@@ -599,11 +651,20 @@ Each invocation writes a new timestamped directory:
 
 ```text
 outputs/relative_map/relative_map_<source>_<timestamp>/
-|-- global_relative_map.ply       # ASCII x y z red green blue
+|-- global_relative_map.ply       # backward-compatible raw scientific PLY
+|-- global_relative_map_raw.ply   # explicit raw scientific PLY
+|-- global_relative_map_display.ply # presentation-only cleaned PLY
 |-- global_points_relative.npy    # finite Nx3 relative map coordinates
 |-- global_colors_rgb.npy         # matching Nx3 uint8 RGB colors
 |-- trajectory_relative.csv       # accepted keyframes only
 |-- trajectory_relative.npy       # accepted camera positions, Nx3
+|-- global_map_preview_front.png
+|-- global_map_preview_oblique.png
+|-- global_map_preview_top.png
+|-- trajectory_xz.png
+|-- trajectory_xy.png
+|-- trajectory_3d.png
+|-- map_overview_panel.png
 |-- frame_stats.jsonl             # frame status, Z/alignment/filter diagnostics
 `-- metadata.json                 # parameters, raw/filter counts, global statistics
 ```
@@ -613,6 +674,11 @@ candidates are retained in `frame_stats.jsonl`. Metadata explicitly records
 the keyframe mode, `is_metric: false`, `depth_type: relative`,
 `scale_estimation_method: depth_pnp`, `translation_step: null`, and
 `depth_alignment_method: scale_and_shift_per_accepted_pair`.
+
+The final `run_pipeline.py` artifact index includes these visual files when
+they exist. It does not launch a second mapping run or a second depth pass to
+create them; the map overview reuses the first prediction already produced by
+the mapper.
 
 Stage 5 is an incremental relative mapping prototype, not a complete production
 SLAM system. Because motion is composed only from consecutive accepted pairs,

@@ -74,20 +74,37 @@ def build_artifact_index(
 ) -> dict[str, Any]:
     root = Path(final_directory).resolve()
     mapping = Path(mapping_run).resolve()
+    mapping_artifacts = {
+        "global_relative_map_ply": relative_path(
+            mapping / "global_relative_map.ply", root
+        ),
+        "trajectory_relative_csv": relative_path(
+            mapping / "trajectory_relative.csv", root
+        ),
+        "trajectory_relative_npy": relative_path(
+            mapping / "trajectory_relative.npy", root
+        ),
+        "frame_statistics": relative_path(mapping / "frame_stats.jsonl", root),
+        "metadata": relative_path(mapping / "metadata.json", root),
+    }
+    optional_mapping_artifacts = {
+        "global_relative_map_raw_ply": "global_relative_map_raw.ply",
+        "global_relative_map_display_ply": "global_relative_map_display.ply",
+        "global_map_preview_front": "global_map_preview_front.png",
+        "global_map_preview_oblique": "global_map_preview_oblique.png",
+        "global_map_preview_top": "global_map_preview_top.png",
+        "trajectory_xz_plot": "trajectory_xz.png",
+        "trajectory_xy_plot": "trajectory_xy.png",
+        "trajectory_3d_plot": "trajectory_3d.png",
+        "map_overview_panel": "map_overview_panel.png",
+    }
+    for key, filename in optional_mapping_artifacts.items():
+        path = mapping / filename
+        if path.is_file():
+            mapping_artifacts[key] = relative_path(path, root)
+
     index: dict[str, Any] = {
-        "mapping": {
-            "global_relative_map_ply": relative_path(
-                mapping / "global_relative_map.ply", root
-            ),
-            "trajectory_relative_csv": relative_path(
-                mapping / "trajectory_relative.csv", root
-            ),
-            "trajectory_relative_npy": relative_path(
-                mapping / "trajectory_relative.npy", root
-            ),
-            "frame_statistics": relative_path(mapping / "frame_stats.jsonl", root),
-            "metadata": relative_path(mapping / "metadata.json", root),
-        },
+        "mapping": mapping_artifacts,
         "evaluation": {
             "frame_metrics_csv": relative_path(
                 Path(evaluation_paths["frame_metrics"]), root

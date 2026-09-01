@@ -26,8 +26,15 @@ from src.depth_estimator import DEFAULT_MODEL, DepthEstimator
 from src.depth_pose_estimator import DepthPoseEstimator
 from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
-from src.ply_io import write_ascii_ply
 from src.video_loader import VideoLoader
+from src.visual_outputs import (
+    CloudVisualArtifacts,
+    display_cleaning_metadata,
+    save_cloud_visual_artifacts,
+    save_map_overview_panel,
+    save_trajectory_previews,
+)
+from src.visualization import colorize_depth
 from tools.run_depth_geometry import build_motion_estimator, build_tracker
 from tools.run_motion import camera_matrix_from_args, load_config
 
@@ -106,6 +113,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", help="Hugging Face Depth Anything model ID")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
+    parser.add_argument(
+        "--save-previews",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save map, trajectory, and overview PNG previews",
+    )
+    parser.add_argument(
+        "--save-display-clean",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save a conservatively cleaned display-only map PLY",
+    )
     parser.add_argument("--ratio-threshold", type=float)
     parser.add_argument("--max-features", type=int)
     parser.add_argument("--minimum-matches", type=int)
@@ -173,20 +192,77 @@ def save_frame_statistics(directory: Path, result: RelativeMapResult) -> None:
 
 
 def save_outputs(
-    directory: Path, result: RelativeMapResult, metadata: dict[str, Any]
-) -> Path:
+    directory: Path,
+    result: RelativeMapResult,
+    metadata: dict[str, Any],
+    visual_config: dict[str, Any],
+    *,
+    save_previews: bool,
+    save_display_clean: bool,
+) -> tuple[Path, CloudVisualArtifacts]:
     np.save(directory / "global_points_relative.npy", result.fused_cloud.points)
     np.save(directory / "global_colors_rgb.npy", result.fused_cloud.colors)
-    ply_path = write_ascii_ply(
-        directory / "global_relative_map.ply",
+    z_low = visual_config.get("display_z_percentile_min", 1.0)
+    z_high = visual_config.get("display_z_percentile_max", 99.0)
+    if (z_low is None) != (z_high is None):
+        raise ValueError("both display Z percentiles must be set or null")
+    z_percentiles = (
+        None if z_low is None else (float(z_low), float(z_high))
+    )
+    center_percentile = visual_config.get(
+        "display_center_distance_percentile", 99.5
+    )
+    artifacts = save_cloud_visual_artifacts(
+        directory,
         result.fused_cloud.points,
         result.fused_cloud.colors,
+        raw_filenames=(
+            "global_relative_map.ply",
+            "global_relative_map_raw.ply",
+        ),
+        display_filename="global_relative_map_display.ply",
+        preview_prefix="global_map_preview",
+        title="Global relative map (display only, non-metric)",
+        save_display_clean=save_display_clean,
+        save_previews=save_previews,
+        z_percentiles=z_percentiles,
+        center_distance_percentile=(
+            None if center_percentile is None else float(center_percentile)
+        ),
+        center_mad_multiplier=float(
+            visual_config.get("display_center_mad_multiplier", 6.0)
+        ),
+        preview_max_points=int(visual_config.get("preview_max_points", 40_000)),
     )
     save_trajectory(directory, result)
     save_frame_statistics(directory, result)
+    if save_previews:
+        save_trajectory_previews(directory, result.trajectory_positions)
+        save_map_overview_panel(
+            directory / "map_overview_panel.png",
+            result.preview_image_bgr,
+            colorize_depth(result.preview_depth_values),
+            result.trajectory_positions,
+            artifacts.cleaning.points,
+            artifacts.cleaning.colors,
+            max_points=int(visual_config.get("overview_max_points", 20_000)),
+        )
+
+    metadata["visual_output"] = display_cleaning_metadata(
+        artifacts.cleaning,
+        raw_artifact="global_relative_map_raw.ply",
+        compatibility_artifact="global_relative_map.ply",
+        display_artifact=(
+            "global_relative_map_display.ply" if save_display_clean else None
+        ),
+    )
+    metadata["visual_output"].update({
+        "previews_saved": save_previews,
+        "display_clean_saved": save_display_clean,
+    })
     with (directory / "metadata.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
-    return ply_path
+    return artifacts.raw_paths[0], artifacts
 
 
 def scientific_metadata(
@@ -261,12 +337,19 @@ def main() -> int:
         motion_config = config.get("motion", {})
         keyframe_config = config.get("keyframes", {})
         map_config = config.get("map", {})
+        visual_config = config.get("visual_output", {})
         output_config = config.get("output", {})
         if not all(isinstance(section, dict) for section in (
-            model_config, motion_config, keyframe_config, map_config, output_config
+            model_config,
+            motion_config,
+            keyframe_config,
+            map_config,
+            visual_config,
+            output_config,
         )):
             raise ValueError(
-                "model, motion, keyframes, map, and output config sections must be mappings"
+                "model, motion, keyframes, map, visual_output, and output config "
+                "sections must be mappings"
             )
         camera_matrix = camera_matrix_from_args(args, config)
 
@@ -332,6 +415,12 @@ def main() -> int:
             if args.keyframes is not None
             else keyframe_config.get("enabled", True)
         )
+        save_previews = bool(setting(
+            args.save_previews, visual_config, "save_previews", True
+        ))
+        save_display_clean = bool(setting(
+            args.save_display_clean, visual_config, "save_display_clean", True
+        ))
         keyframe_thresholds = KeyframeThresholds(
             enabled=keyframes_enabled,
             min_good_matches=keyframe_config.get("min_good_matches", 100),
@@ -522,7 +611,14 @@ def main() -> int:
                 else "Metric-mode values remain subject to model and calibration error."
             ),
         }
-        ply_path = save_outputs(run_directory, result, metadata)
+        ply_path, visual_artifacts = save_outputs(
+            run_directory,
+            result,
+            metadata,
+            visual_config,
+            save_previews=save_previews,
+            save_display_clean=save_display_clean,
+        )
 
         print("Relative multi-frame map completed")
         print(f"Sampled frames: {result.sampled_frame_count}")
@@ -594,6 +690,12 @@ def main() -> int:
                 "not metres."
             )
         print(f"Final map: {ply_path.resolve()}")
+        print(
+            "Display cleaning (presentation only): "
+            f"{visual_artifacts.cleaning.raw_count} raw -> "
+            f"{visual_artifacts.cleaning.display_count} displayed "
+            f"({visual_artifacts.cleaning.removed_count} removed)"
+        )
         print(f"Outputs: {run_directory.resolve()}")
         return 0
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:

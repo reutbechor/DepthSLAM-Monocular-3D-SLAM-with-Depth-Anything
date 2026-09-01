@@ -126,6 +126,10 @@ class RelativeMapResult:
     translation_units: str
     keyframes_enabled: bool
     stage_timings: dict[str, float]
+    # Presentation assets from the already-computed first prediction.  Exposing
+    # these avoids a second model inference when report previews are saved.
+    preview_image_bgr: np.ndarray
+    preview_depth_values: np.ndarray
 
 
 class RelativeMapBuilder:
@@ -747,4 +751,6 @@ class RelativeMapBuilder:
             ),
             keyframes_enabled=self.keyframe_selector.thresholds.enabled,
             stage_timings=dict(self._stage_timings),
+            preview_image_bgr=first.image.copy(),
+            preview_depth_values=first_prediction.values.copy(),
         )
