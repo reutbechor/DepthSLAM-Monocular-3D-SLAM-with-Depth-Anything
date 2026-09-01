@@ -249,6 +249,48 @@ def save_point_cloud_preview(
     return destination
 
 
+def save_depth_stabilization_comparison(
+    directory: str | Path,
+    unstabilized_points: np.ndarray,
+    unstabilized_colors: np.ndarray,
+    stabilized_points: np.ndarray,
+    stabilized_colors: np.ndarray,
+    *,
+    preview_max_points: int = 40_000,
+) -> dict[str, Path]:
+    """Save matched raw-map comparisons without display-only point filtering."""
+
+    output = Path(directory)
+    output.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "unstabilized_ply": output / "global_relative_map_unstabilized.ply",
+        "stabilized_ply": output / "global_relative_map_stabilized.ply",
+        "unstabilized_oblique": output / "global_map_unstabilized_oblique.png",
+        "stabilized_oblique": output / "global_map_stabilized_oblique.png",
+        "unstabilized_top": output / "global_map_unstabilized_top.png",
+        "stabilized_top": output / "global_map_stabilized_top.png",
+    }
+    write_ascii_ply(
+        paths["unstabilized_ply"], unstabilized_points, unstabilized_colors
+    )
+    write_ascii_ply(paths["stabilized_ply"], stabilized_points, stabilized_colors)
+    for variant, points, colors in (
+        ("unstabilized", unstabilized_points, unstabilized_colors),
+        ("stabilized", stabilized_points, stabilized_colors),
+    ):
+        title = f"{variant.capitalize()} relative map (non-metric)"
+        for view in ("oblique", "top"):
+            save_point_cloud_preview(
+                paths[f"{variant}_{view}"],
+                points,
+                colors,
+                view=view,
+                title=title,
+                max_points=preview_max_points,
+            )
+    return paths
+
+
 def save_cloud_visual_artifacts(
     directory: str | Path,
     points: np.ndarray,

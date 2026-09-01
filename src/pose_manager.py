@@ -23,6 +23,27 @@ class PoseManager:
     def __init__(self) -> None:
         self._poses: list[np.ndarray] = [np.eye(4, dtype=np.float64)]
 
+    @staticmethod
+    def compose_world_pose(
+        previous_world_pose: np.ndarray,
+        rotation_previous_to_current: np.ndarray,
+        translation_previous_to_current: np.ndarray,
+    ) -> np.ndarray:
+        """Return T_world_current from T_world_previous and T_current_previous."""
+
+        previous = np.asarray(previous_world_pose, dtype=np.float64)
+        if (
+            previous.shape != (4, 4)
+            or not np.isfinite(previous).all()
+            or not np.allclose(previous[3], [0.0, 0.0, 0.0, 1.0])
+        ):
+            raise ValueError("previous_world_pose must be a finite rigid 4x4 transform")
+        transform_current_previous = make_transform(
+            rotation_previous_to_current, translation_previous_to_current
+        )
+        transform_previous_current = invert_transform(transform_current_previous)
+        return previous @ transform_previous_current
+
     def add_scaled_relative_pose(
         self, rotation_previous_to_current: np.ndarray, translation_previous_to_current: np.ndarray
     ) -> np.ndarray:
@@ -33,11 +54,9 @@ class PoseManager:
         translation = translation.reshape(3)
         if not np.isfinite(translation).all():
             raise ValueError("translation must be finite")
-        transform_current_previous = make_transform(
-            rotation_previous_to_current, translation
+        transform_world_current = self.compose_world_pose(
+            self._poses[-1], rotation_previous_to_current, translation
         )
-        transform_previous_current = invert_transform(transform_current_previous)
-        transform_world_current = self._poses[-1] @ transform_previous_current
         self._poses.append(transform_world_current)
         return transform_world_current.copy()
 

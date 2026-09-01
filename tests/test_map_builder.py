@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from src.depth_alignment import DepthAlignmentResult
+from src.depth_stabilization import DepthStabilizationConfig
 from src.map_builder import MappingFrame, RelativeMapBuilder
 from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.depth_types import CameraDepth, DepthPrediction
@@ -226,6 +227,31 @@ class MapBuilderTests(unittest.TestCase):
         np.testing.assert_array_equal(result.trajectory_frame_indices, [42])
         np.testing.assert_allclose(result.trajectory_positions, [[0.0, 0.0, 0.0]])
         self.assertEqual(result.frame_statistics[0].reason, "world_origin")
+
+    def test_enabled_depth_stabilization_adds_independent_comparison_fusion(self) -> None:
+        depth = FakeDepthEstimator()
+        builder = RelativeMapBuilder(
+            depth_estimator=depth,
+            feature_tracker=FakeFeatureTracker(),
+            motion_estimator=RejectingMotionEstimator(),
+            camera_matrix=np.eye(3),
+            keyframe_selector=disabled_keyframes(),
+            point_cloud_stride=1,
+            voxel_size=0.1,
+            depth_stabilization=DepthStabilizationConfig(enabled=True),
+        )
+
+        result = builder.build([self.frame(0)])
+
+        self.assertTrue(result.depth_stabilization_enabled)
+        self.assertIsNotNone(result.stabilized_fused_cloud)
+        assert result.stabilized_fused_cloud is not None
+        np.testing.assert_array_equal(
+            result.stabilized_fused_cloud.points, result.fused_cloud.points
+        )
+        self.assertTrue(
+            result.frame_statistics[0].depth_stabilization_accepted
+        )
 
     def test_rejected_motion_adds_neither_pose_nor_cloud(self) -> None:
         depth = FakeDepthEstimator()

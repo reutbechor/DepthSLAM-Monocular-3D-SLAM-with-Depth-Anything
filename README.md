@@ -721,6 +721,147 @@ them changes the scientific acceptance policy and should be justified for the
 dataset; the implementation does not silently tune them merely to produce more
 accepted or rejected frames.
 
+## Optional 3D–3D pose refinement
+
+Low 2D PnP reprojection error does not guarantee perfect overlap between two
+dense clouds: independently inferred monocular depth can still disagree along
+the viewing direction. The optional `pose_refinement_3d` stage therefore uses
+only the already accepted PnP feature matches, backprojects them with the
+previous camera-Z map and the current camera-Z map after its existing
+scale/shift alignment, and obtains matched relative 3D points.
+
+The stage estimates the rigid transform
+`P_current = R @ P_previous + t` using transparent NumPy Kabsch/SVD inside a
+deterministic three-point RANSAC loop. The inlier threshold is a configurable
+fraction of the matched points' robust spatial spread, so it remains in the
+same relative units as the reconstruction. Kabsch estimates rotation and
+translation only: no similarity scale is estimated or silently applied.
+
+Both the original PnP pose and the 3D candidate are retained. The candidate is
+used only when it has enough correspondences and robust inliers, improves the
+median 3D residual by the configured fraction, remains a valid finite SO(3)
+transform, and is not an extreme jump from PnP. Otherwise mapping continues
+with the original PnP pose; optional refinement failure never rejects the
+keyframe or fails the run. The feature matcher, Essential Matrix, PnP, depth
+alignment, quality gates, keyframes, and map generation are unchanged.
+
+The feature is disabled by default. A focused two-frame experiment can be run
+with:
+
+```powershell
+py tools\run_relative_map.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 15 --max-candidate-frames 2 --point-cloud-stride 4 --device cpu --keyframes --pose-refinement-3d
+```
+
+When an accepted pair reaches the refinement stage, the run saves
+`pair_alignment_before.ply`, `pair_alignment_after.ply`,
+`pair_alignment_metrics.json`, and matching oblique PNG previews. The two PLY
+files contain the same two raw camera clouds; only the current cloud's selected
+pose differs. If the candidate is rejected, the after artifact equals the PnP
+baseline and the reason is explicit.
+
+All matched 3D points still originate from monocular relative depth. The scale
+remains relative and non-metric, and Kabsch does not create ground truth.
+Reduced correspondence residuals do not prove absolute accuracy. Pairwise
+refinement cannot eliminate accumulated drift, and longer sequences may still
+require loop closure or bundle adjustment. Approximate camera intrinsics remain
+an independent source of geometric error.
+
+The mandated CPU validation was run only on frames 0 and 15. It produced 2,882
+valid matched 3D correspondences and 1,607 robust inliers. Median residual fell
+from 0.019291 to 0.018329 relative units (4.99%), but RMSE rose from 0.075664 to
+0.076931. Because the median improvement was below the configured 10% gate,
+the candidate was rejected and the saved after cloud intentionally equals the
+PnP baseline. No three-frame or full-map refinement experiment was run.
+
+## Diagnostic-only multi-frame drift analysis
+
+`run_relative_map.py` saves read-only drift diagnostics by default under each
+run's `drift_diagnostics/` directory. Disable them with
+`--no-save-drift-diagnostics` or `diagnostics.save_drift_diagnostics: false`.
+This changes only diagnostic files: it does not smooth or normalize depth,
+alter a pose, reject a frame, change fusion, or feed any value back into the
+mapper.
+
+The CSV and JSON contain one row per accepted keyframe, including affine depth
+scale/shift, aligned relative-Z statistics, selected relative translation,
+cumulative position and rotation, existing image/depth quality metrics, and
+optional 3D-refinement evidence. `drift_summary.json` reports ranges,
+first-to-last changes, path length, and descriptive linear slopes. Slopes have
+no statistical-significance claim.
+
+```text
+drift_diagnostics/
+|-- drift_diagnostics.csv
+|-- drift_diagnostics.json
+|-- drift_summary.json
+|-- depth_alignment_scale_vs_frame.png
+|-- depth_alignment_shift_vs_frame.png
+|-- aligned_z_median_vs_frame.png
+|-- aligned_z_p99_vs_frame.png
+|-- translation_magnitude_vs_frame.png
+|-- cumulative_distance_vs_frame.png
+|-- reprojection_rmse_vs_frame.png
+|-- depth_alignment_inlier_ratio_vs_frame.png
+`-- drift_overview.png
+```
+
+Warning flags for scale range, shift range, p99 growth, and mostly monotonic
+distance from the origin are explicitly marked `heuristic_only`. They help
+separate evidence for depth inconsistency from pose accumulation, but they are
+not proof of drift, ground truth, or metric accuracy. All geometric quantities
+remain relative and non-metric.
+
+## Experimental aligned-depth tail stabilization
+
+The relative-map CLI includes an optional post-alignment robustness experiment.
+It is disabled by default and can be enabled with `--depth-stabilization` or
+`depth_stabilization.enabled: true`. The established affine alignment remains
+unchanged:
+
+```text
+raw relative disparity d
+    -> existing scale/shift alignment a, b
+    -> preserved raw relative Z = a / (d - b)
+    -> optional tail mask used only by a second comparison fusion
+```
+
+For finite positive aligned Z, the experiment computes a ratio bound
+`median(Z) * max_z_over_median` and a robust bound
+`median(Z) + mad_multiplier * 1.4826 * MAD(Z)`. It uses the larger bound, so a
+sample must exceed both conservative estimates before it is rejected. Rejected
+samples become `NaN`; values are never clamped into a synthetic surface. If the
+candidate mask would remove too many samples or leave insufficient valid
+coverage, the comparison fusion falls back to the original aligned depth.
+
+The raw map, alignment parameters, pose estimation, keyframe decisions, quality
+gates, and fusion path remain preserved. When enabled, the same accepted poses
+also generate these directly comparable, unfiltered scientific/preview assets:
+
+```text
+global_relative_map_unstabilized.ply
+global_relative_map_stabilized.ply
+global_map_unstabilized_oblique.png
+global_map_stabilized_oblique.png
+global_map_unstabilized_top.png
+global_map_stabilized_top.png
+```
+
+Per-keyframe `frame_stats.jsonl` records raw alignment, denominator percentiles,
+raw/stabilized Z statistics and counts, temporal median/p95 ratios, removal
+ratios, fallback reasons, and whether stabilization was accepted. The
+comparison previews use the scientific point sets directly and apply no
+display-only filtering difference.
+
+Example focused experiment:
+
+```powershell
+py tools\run_relative_map.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 15 --max-candidate-frames 3 --point-cloud-stride 4 --device cpu --keyframes --depth-stabilization
+```
+
+This remains monocular relative depth, not metric depth. Tail removal is a
+robustness heuristic that may reduce smearing from unstable aligned-depth
+tails; it does not correct pose drift or prove geometric accuracy.
+
 ## Stage 6: visual keyframe selection
 
 A keyframe is a candidate image selected to contribute a pose and dense cloud

@@ -23,15 +23,27 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 from src.depth_estimator import DEFAULT_MODEL, DepthEstimator
+from src.drift_diagnostics import (
+    collect_drift_diagnostics,
+    save_drift_diagnostics,
+)
 from src.depth_pose_estimator import DepthPoseEstimator
+from src.depth_stabilization import DepthStabilizationConfig
 from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
+from src.ply_io import write_ascii_ply
+from src.pose_refinement_3d import (
+    PoseRefinement3DConfig,
+    RobustPoseRefiner3D,
+)
 from src.video_loader import VideoLoader
 from src.visual_outputs import (
     CloudVisualArtifacts,
     display_cleaning_metadata,
     save_cloud_visual_artifacts,
+    save_depth_stabilization_comparison,
     save_map_overview_panel,
+    save_point_cloud_preview,
     save_trajectory_previews,
 )
 from src.visualization import colorize_depth
@@ -114,6 +126,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", help="Hugging Face Depth Anything model ID")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"))
     parser.add_argument(
+        "--pose-refinement-3d",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable optional robust matched-point 3D-to-3D pose refinement",
+    )
+    parser.add_argument(
+        "--depth-stabilization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable experimental post-alignment relative-Z tail rejection",
+    )
+    parser.add_argument(
         "--save-previews",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -124,6 +148,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Save a conservatively cleaned display-only map PLY",
+    )
+    parser.add_argument(
+        "--save-drift-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save diagnostic-only accepted-keyframe drift tables and plots",
     )
     parser.add_argument("--ratio-threshold", type=float)
     parser.add_argument("--max-features", type=int)
@@ -191,6 +221,93 @@ def save_frame_statistics(directory: Path, result: RelativeMapResult) -> None:
             file.write(json.dumps(statistics.to_dict()) + "\n")
 
 
+def save_pair_alignment_artifacts(
+    directory: Path,
+    result: RelativeMapResult,
+    *,
+    save_previews: bool,
+    preview_max_points: int,
+) -> dict[str, str] | None:
+    """Save the first accepted refined pair under baseline and selected poses."""
+
+    pair = result.pair_alignment
+    if pair is None:
+        return None
+    before_path = write_ascii_ply(
+        directory / "pair_alignment_before.ply",
+        pair.clouds.before_points,
+        pair.clouds.colors,
+    )
+    after_path = write_ascii_ply(
+        directory / "pair_alignment_after.ply",
+        pair.clouds.after_points,
+        pair.clouds.colors,
+    )
+    metrics_path = directory / "pair_alignment_metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as file:
+        json.dump(pair.metrics, file, indent=2)
+    paths = {
+        "before_ply": before_path.name,
+        "after_ply": after_path.name,
+        "metrics": metrics_path.name,
+    }
+    if save_previews:
+        before_preview = save_point_cloud_preview(
+            directory / "pair_alignment_before_oblique.png",
+            pair.clouds.before_points,
+            pair.clouds.colors,
+            view="oblique",
+            title="Pair alignment before 3D refinement (PnP, relative/non-metric)",
+            max_points=preview_max_points,
+        )
+        after_preview = save_point_cloud_preview(
+            directory / "pair_alignment_after_oblique.png",
+            pair.clouds.after_points,
+            pair.clouds.colors,
+            view="oblique",
+            title="Pair alignment after gated 3D refinement (relative/non-metric)",
+            max_points=preview_max_points,
+        )
+        paths.update({
+            "before_preview": before_preview.name,
+            "after_preview": after_preview.name,
+        })
+    return paths
+
+
+def save_optional_drift_diagnostics(
+    directory: Path,
+    result: RelativeMapResult,
+    metadata: dict[str, Any],
+    *,
+    enabled: bool,
+) -> dict[str, Any] | None:
+    """Write read-only drift diagnostics, or explicitly record they are off."""
+
+    if not enabled:
+        metadata["drift_diagnostics"] = {
+            "enabled": False,
+            "diagnostic_only": True,
+        }
+        return None
+    drift = save_drift_diagnostics(
+        directory,
+        collect_drift_diagnostics(result.frame_statistics),
+        generate_plots=True,
+    )
+    metadata["drift_diagnostics"] = {
+        "enabled": True,
+        "diagnostic_only": True,
+        "directory": Path(drift["directory"]).name,
+        "csv": Path(drift["csv"]).name,
+        "json": Path(drift["json"]).name,
+        "summary": Path(drift["summary_path"]).name,
+        "plots": [Path(path).name for path in drift["plots"]],
+        "results": drift["summary"],
+    }
+    return drift
+
+
 def save_outputs(
     directory: Path,
     result: RelativeMapResult,
@@ -199,6 +316,7 @@ def save_outputs(
     *,
     save_previews: bool,
     save_display_clean: bool,
+    save_drift: bool,
 ) -> tuple[Path, CloudVisualArtifacts]:
     np.save(directory / "global_points_relative.npy", result.fused_cloud.points)
     np.save(directory / "global_colors_rgb.npy", result.fused_cloud.colors)
@@ -236,6 +354,12 @@ def save_outputs(
     )
     save_trajectory(directory, result)
     save_frame_statistics(directory, result)
+    pair_artifacts = save_pair_alignment_artifacts(
+        directory,
+        result,
+        save_previews=save_previews,
+        preview_max_points=int(visual_config.get("preview_max_points", 40_000)),
+    )
     if save_previews:
         save_trajectory_previews(directory, result.trajectory_positions)
         save_map_overview_panel(
@@ -260,6 +384,33 @@ def save_outputs(
         "previews_saved": save_previews,
         "display_clean_saved": save_display_clean,
     })
+    metadata["pair_alignment_artifacts"] = pair_artifacts
+    if result.depth_stabilization_enabled:
+        if result.stabilized_fused_cloud is None:
+            raise RuntimeError("enabled depth stabilization produced no comparison map")
+        comparison = save_depth_stabilization_comparison(
+            directory,
+            result.fused_cloud.points,
+            result.fused_cloud.colors,
+            result.stabilized_fused_cloud.points,
+            result.stabilized_fused_cloud.colors,
+            preview_max_points=int(visual_config.get("preview_max_points", 40_000)),
+        )
+        metadata["depth_stabilization"]["comparison_artifacts"] = {
+            name: path.name for name, path in comparison.items()
+        }
+        metadata["depth_stabilization"].update({
+            "unstabilized_map_point_count": result.fused_cloud.output_point_count,
+            "stabilized_map_point_count": (
+                result.stabilized_fused_cloud.output_point_count
+            ),
+            "comparison_display_filtering": "none",
+        })
+    else:
+        metadata["depth_stabilization"]["comparison_artifacts"] = None
+    save_optional_drift_diagnostics(
+        directory, result, metadata, enabled=save_drift
+    )
     with (directory / "metadata.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
     return artifacts.raw_paths[0], artifacts
@@ -337,19 +488,26 @@ def main() -> int:
         motion_config = config.get("motion", {})
         keyframe_config = config.get("keyframes", {})
         map_config = config.get("map", {})
+        pose_refinement_config = config.get("pose_refinement_3d", {})
+        depth_stabilization_config = config.get("depth_stabilization", {})
         visual_config = config.get("visual_output", {})
+        diagnostics_config = config.get("diagnostics", {})
         output_config = config.get("output", {})
         if not all(isinstance(section, dict) for section in (
             model_config,
             motion_config,
             keyframe_config,
             map_config,
+            pose_refinement_config,
+            depth_stabilization_config,
             visual_config,
+            diagnostics_config,
             output_config,
         )):
             raise ValueError(
-                "model, motion, keyframes, map, visual_output, and output config "
-                "sections must be mappings"
+                "model, motion, keyframes, map, pose_refinement_3d, "
+                "depth_stabilization, visual_output, diagnostics, and output "
+                "config sections must be mappings"
             )
         camera_matrix = camera_matrix_from_args(args, config)
 
@@ -421,6 +579,65 @@ def main() -> int:
         save_display_clean = bool(setting(
             args.save_display_clean, visual_config, "save_display_clean", True
         ))
+        save_drift = bool(setting(
+            args.save_drift_diagnostics,
+            diagnostics_config,
+            "save_drift_diagnostics",
+            True,
+        ))
+        refinement_3d_settings = PoseRefinement3DConfig(
+            enabled=bool(setting(
+                args.pose_refinement_3d,
+                pose_refinement_config,
+                "enabled",
+                False,
+            )),
+            minimum_correspondences=int(pose_refinement_config.get(
+                "minimum_correspondences", 100
+            )),
+            minimum_inliers=int(pose_refinement_config.get(
+                "minimum_inliers", 80
+            )),
+            minimum_inlier_ratio=float(pose_refinement_config.get(
+                "minimum_inlier_ratio", 0.40
+            )),
+            minimum_relative_improvement=float(pose_refinement_config.get(
+                "minimum_relative_improvement", 0.10
+            )),
+            random_seed=int(pose_refinement_config.get("random_seed", 0)),
+            ransac_iterations=int(pose_refinement_config.get(
+                "ransac_iterations", 512
+            )),
+            residual_threshold_fraction=float(pose_refinement_config.get(
+                "residual_threshold_fraction", 0.05
+            )),
+            maximum_translation_change_ratio=float(pose_refinement_config.get(
+                "maximum_translation_change_ratio", 2.0
+            )),
+            maximum_rotation_change_degrees=float(pose_refinement_config.get(
+                "maximum_rotation_change_degrees", 10.0
+            )),
+        )
+        depth_stabilization_settings = DepthStabilizationConfig(
+            enabled=bool(setting(
+                args.depth_stabilization,
+                depth_stabilization_config,
+                "enabled",
+                False,
+            )),
+            max_z_over_median=float(depth_stabilization_config.get(
+                "max_z_over_median", 12.0
+            )),
+            mad_multiplier=float(depth_stabilization_config.get(
+                "mad_multiplier", 8.0
+            )),
+            minimum_valid_ratio=float(depth_stabilization_config.get(
+                "minimum_valid_ratio", 0.70
+            )),
+            maximum_removed_ratio=float(depth_stabilization_config.get(
+                "maximum_removed_ratio", 0.20
+            )),
+        )
         keyframe_thresholds = KeyframeThresholds(
             enabled=keyframes_enabled,
             min_good_matches=keyframe_config.get("min_good_matches", 100),
@@ -500,6 +717,8 @@ def main() -> int:
                     "pnp_reprojection_error_pixels", 3.0,
                 )),
             ),
+            pose_refiner_3d=RobustPoseRefiner3D(refinement_3d_settings),
+            depth_stabilization=depth_stabilization_settings,
         )
         result = builder.build(selected_frames)
         total_pipeline_runtime = perf_counter() - pipeline_started
@@ -564,6 +783,104 @@ def main() -> int:
                     builder.depth_pose_estimator.reprojection_error_pixels
                 ),
             },
+            "pose_refinement_3d": {
+                "enabled": refinement_3d_settings.enabled,
+                "transform_convention": "current_from_previous",
+                "scale_estimation_applied": False,
+                "minimum_correspondences": (
+                    refinement_3d_settings.minimum_correspondences
+                ),
+                "minimum_inliers": refinement_3d_settings.minimum_inliers,
+                "minimum_inlier_ratio": (
+                    refinement_3d_settings.minimum_inlier_ratio
+                ),
+                "minimum_relative_improvement": (
+                    refinement_3d_settings.minimum_relative_improvement
+                ),
+                "random_seed": refinement_3d_settings.random_seed,
+                "ransac_iterations": refinement_3d_settings.ransac_iterations,
+                "residual_threshold_fraction": (
+                    refinement_3d_settings.residual_threshold_fraction
+                ),
+                "maximum_translation_change_ratio": (
+                    refinement_3d_settings.maximum_translation_change_ratio
+                ),
+                "maximum_rotation_change_degrees": (
+                    refinement_3d_settings.maximum_rotation_change_degrees
+                ),
+                "attempted_pairs": sum(
+                    item.refinement_3d_attempted
+                    for item in result.frame_statistics
+                ),
+                "accepted_pairs": sum(
+                    item.refinement_3d_accepted
+                    for item in result.frame_statistics
+                ),
+                "reason_counts": {
+                    reason: sum(
+                        item.refinement_3d_reason == reason
+                        for item in result.frame_statistics
+                    )
+                    for reason in sorted({
+                        item.refinement_3d_reason
+                        for item in result.frame_statistics
+                        if item.refinement_3d_reason is not None
+                    })
+                },
+                "first_pair_result": (
+                    None
+                    if result.pair_alignment is None
+                    else result.pair_alignment.metrics
+                ),
+            },
+            "depth_stabilization": {
+                "enabled": depth_stabilization_settings.enabled,
+                "experimental": True,
+                "method": "post_alignment_robust_z_tail_rejection",
+                "changes_alignment_scale_or_shift": False,
+                "clamps_depth_values": False,
+                "affects_pose_estimation": False,
+                "coordinate_scale": "relative_non_metric",
+                "max_z_over_median": (
+                    depth_stabilization_settings.max_z_over_median
+                ),
+                "mad_multiplier": depth_stabilization_settings.mad_multiplier,
+                "minimum_valid_ratio": (
+                    depth_stabilization_settings.minimum_valid_ratio
+                ),
+                "maximum_removed_ratio": (
+                    depth_stabilization_settings.maximum_removed_ratio
+                ),
+                "attempted_frames": sum(
+                    item.depth_stabilization_attempted
+                    for item in result.frame_statistics
+                ),
+                "accepted_frames": sum(
+                    item.depth_stabilization_accepted
+                    for item in result.frame_statistics
+                ),
+                "reason_counts": {
+                    reason: sum(
+                        item.depth_stabilization_reason == reason
+                        for item in result.frame_statistics
+                    )
+                    for reason in sorted({
+                        item.depth_stabilization_reason
+                        for item in result.frame_statistics
+                        if item.depth_stabilization_reason is not None
+                    })
+                },
+                "stabilized_raw_fused_point_count": (
+                    result.stabilized_raw_fused_point_count
+                ),
+                "stabilized_voxel_downsampled_point_count": (
+                    result.stabilized_voxel_downsampled_point_count
+                ),
+                "scientific_note": (
+                    "Relative monocular depth robustness heuristic; it does not "
+                    "make depth metric, correct pose drift, or prove accuracy."
+                ),
+            },
             "depth_quality_thresholds": {
                 "min_valid_depth_ratio": min_valid_depth_ratio,
                 "max_denominator_reject_ratio": max_denominator_reject_ratio,
@@ -618,6 +935,7 @@ def main() -> int:
             visual_config,
             save_previews=save_previews,
             save_display_clean=save_display_clean,
+            save_drift=save_drift,
         )
 
         print("Relative multi-frame map completed")
@@ -633,6 +951,12 @@ def main() -> int:
             f"({result.global_filter.method})"
         )
         print(f"Final map points: {result.fused_cloud.output_point_count}")
+        if result.depth_stabilization_enabled:
+            assert result.stabilized_fused_cloud is not None
+            print(
+                "Experimental stabilized map points: "
+                f"{result.stabilized_fused_cloud.output_point_count}"
+            )
         print(f"Relative trajectory poses: {result.trajectory_positions.shape[0]}")
         for item in result.frame_statistics:
             if item.status == "rejected":
@@ -658,6 +982,34 @@ def main() -> int:
                 f"Z median={item.aligned_z_median}, Z p99={item.aligned_z_p99}, "
                 f"p99/median={item.relative_z_p99_over_median}"
             )
+            if item.accepted and result.depth_stabilization_enabled:
+                print(
+                    "  Depth stabilization: "
+                    f"accepted={item.depth_stabilization_accepted}, "
+                    f"reason={item.depth_stabilization_reason}, "
+                    f"raw median/p95/p99={item.raw_z_median}/"
+                    f"{item.raw_z_p95}/{item.raw_z_p99}, "
+                    f"stabilized median/p95/p99={item.stabilized_z_median}/"
+                    f"{item.stabilized_z_p95}/{item.stabilized_z_p99}, "
+                    f"removed={item.stabilization_removed_count} "
+                    f"({item.stabilization_removed_ratio:.6f}), "
+                    f"denominator p01/p05/median={item.denominator_p01}/"
+                    f"{item.denominator_p05}/{item.denominator_median}"
+                )
+            if item.refinement_3d_attempted:
+                print(
+                    "  3D refinement: "
+                    f"correspondences={item.correspondence_3d_count}, "
+                    f"inliers={item.refinement_3d_inliers}, "
+                    f"inlier_ratio={item.refinement_3d_inlier_ratio:.6f}, "
+                    f"baseline_median={item.baseline_3d_residual_median}, "
+                    f"baseline_rmse={item.baseline_3d_residual_rmse}, "
+                    f"refined_median={item.refined_3d_residual_median}, "
+                    f"refined_rmse={item.refined_3d_residual_rmse}, "
+                    f"improvement={item.refinement_3d_relative_improvement}, "
+                    f"accepted={item.refinement_3d_accepted}, "
+                    f"reason={item.refinement_3d_reason}"
+                )
             if item.z_statistics is None:
                 continue
             print(
@@ -690,12 +1042,35 @@ def main() -> int:
                 "not metres."
             )
         print(f"Final map: {ply_path.resolve()}")
+        if result.pair_alignment is not None:
+            print(
+                "Pair alignment before: "
+                f"{(run_directory / 'pair_alignment_before.ply').resolve()}"
+            )
+            print(
+                "Pair alignment after: "
+                f"{(run_directory / 'pair_alignment_after.ply').resolve()}"
+            )
+            print(
+                "Pair alignment metrics: "
+                f"{(run_directory / 'pair_alignment_metrics.json').resolve()}"
+            )
         print(
             "Display cleaning (presentation only): "
             f"{visual_artifacts.cleaning.raw_count} raw -> "
             f"{visual_artifacts.cleaning.display_count} displayed "
             f"({visual_artifacts.cleaning.removed_count} removed)"
         )
+        if save_drift:
+            drift_summary = metadata["drift_diagnostics"]["results"]
+            print(
+                "Drift diagnostics (heuristic only): "
+                f"{drift_summary['heuristic_warning_flags']}"
+            )
+            print(
+                "Drift diagnostic directory: "
+                f"{(run_directory / 'drift_diagnostics').resolve()}"
+            )
         print(f"Outputs: {run_directory.resolve()}")
         return 0
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:

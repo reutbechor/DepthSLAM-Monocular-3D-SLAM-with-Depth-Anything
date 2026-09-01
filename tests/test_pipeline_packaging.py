@@ -119,8 +119,30 @@ def _write_mapping_run(root: Path, source: Path, *, complete: bool = True) -> Pa
             "trajectory_xy.png",
             "trajectory_3d.png",
             "map_overview_panel.png",
+            "pair_alignment_before.ply",
+            "pair_alignment_after.ply",
+            "pair_alignment_metrics.json",
+            "pair_alignment_before_oblique.png",
+            "pair_alignment_after_oblique.png",
         ):
             (run / name).write_bytes(b"fixture")
+        drift = run / "drift_diagnostics"
+        drift.mkdir()
+        for name in (
+            "drift_diagnostics.csv",
+            "drift_diagnostics.json",
+            "drift_summary.json",
+            "drift_overview.png",
+            "depth_alignment_scale_vs_frame.png",
+            "depth_alignment_shift_vs_frame.png",
+            "aligned_z_median_vs_frame.png",
+            "aligned_z_p99_vs_frame.png",
+            "translation_magnitude_vs_frame.png",
+            "cumulative_distance_vs_frame.png",
+            "reprojection_rmse_vs_frame.png",
+            "depth_alignment_inlier_ratio_vs_frame.png",
+        ):
+            (drift / name).write_bytes(b"fixture")
     return run
 
 
@@ -224,6 +246,12 @@ def test_artifact_references_exist_and_evaluation_paths_are_correct(
         "global_relative_map_display.ply"
     )
     assert mapping["map_overview_panel"].endswith("map_overview_panel.png")
+    assert mapping["pair_alignment_metrics"].endswith(
+        "pair_alignment_metrics.json"
+    )
+    assert mapping["drift_summary"].endswith(
+        "drift_diagnostics/drift_summary.json"
+    )
 
 
 def test_missing_required_mapping_artifact_fails_clearly(

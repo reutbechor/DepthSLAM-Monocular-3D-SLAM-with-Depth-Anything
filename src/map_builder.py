@@ -11,6 +11,10 @@ import numpy as np
 
 from .backprojection import validate_camera_matrix
 from .depth_alignment import align_prediction_to_pose
+from .depth_stabilization import (
+    DepthStabilizationConfig,
+    stabilize_aligned_depth,
+)
 from .depth_pose_estimator import DepthPoseEstimator
 from .depth_quality import (
     DepthAlignmentQualityMetrics,
@@ -24,6 +28,14 @@ from .keyframe_selector import KeyframeSelectionResult, KeyframeSelector
 from .map_fusion import FusedPointCloud, RelativeMapFusion
 from .point_cloud import PointCloudResult, generate_colored_point_cloud
 from .pose_manager import PoseManager
+from .pose_refinement_3d import (
+    PairAlignmentClouds,
+    PoseRefinement3DConfig,
+    PoseRefinement3DResult,
+    RobustPoseRefiner3D,
+    build_3d_correspondences,
+    build_pair_alignment_clouds,
+)
 from .robust_filtering import GlobalOutlierFilterResult, filter_global_radius
 from .transforms import transform_points
 
@@ -91,6 +103,53 @@ class FrameMapStatistics:
     depth_outlier_rejected_count: int = 0
     cloud_points: int = 0
     camera_position: tuple[float, float, float] | None = None
+    refinement_3d_attempted: bool = False
+    correspondence_3d_count: int = 0
+    refinement_3d_inliers: int = 0
+    refinement_3d_inlier_ratio: float = 0.0
+    baseline_3d_residual_median: float | None = None
+    refined_3d_residual_median: float | None = None
+    baseline_3d_residual_rmse: float | None = None
+    refined_3d_residual_rmse: float | None = None
+    refinement_3d_relative_improvement: float | None = None
+    refinement_3d_accepted: bool = False
+    refinement_3d_reason: str | None = None
+    relative_translation: tuple[float, float, float] | None = None
+    selected_relative_rotation_deg: float | None = None
+    cumulative_rotation_deg: float | None = None
+    raw_alignment_a: float | None = None
+    raw_alignment_b: float | None = None
+    denominator_min: float | None = None
+    denominator_p01: float | None = None
+    denominator_p05: float | None = None
+    denominator_median: float | None = None
+    denominator_p95: float | None = None
+    fraction_denominator_below_1pct_median: float | None = None
+    fraction_denominator_below_5pct_median: float | None = None
+    depth_stabilization_attempted: bool = False
+    depth_stabilization_accepted: bool = False
+    depth_stabilization_reason: str | None = None
+    raw_valid_point_count: int = 0
+    stabilized_valid_point_count: int = 0
+    stabilization_candidate_removed_count: int = 0
+    stabilization_candidate_removed_ratio: float = 0.0
+    stabilization_removed_count: int = 0
+    stabilization_removed_ratio: float = 0.0
+    raw_z_median: float | None = None
+    raw_z_p95: float | None = None
+    raw_z_p99: float | None = None
+    raw_z_max: float | None = None
+    raw_z_p99_over_median: float | None = None
+    stabilized_z_median: float | None = None
+    stabilized_z_p95: float | None = None
+    stabilized_z_p99: float | None = None
+    stabilized_z_max: float | None = None
+    stabilized_z_p99_over_median: float | None = None
+    median_z_ratio_to_previous: float | None = None
+    p95_z_ratio_to_previous: float | None = None
+    robust_upper_z_limit: float | None = None
+    ratio_upper_z_limit: float | None = None
+    mad_upper_z_limit: float | None = None
 
     def __post_init__(self) -> None:
         valid_statuses = {"accepted_keyframe", "skipped_non_keyframe", "rejected"}
@@ -100,7 +159,29 @@ class FrameMapStatistics:
             raise ValueError("accepted must match accepted_keyframe status")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        for internal, external in (
+            ("refinement_3d_attempted", "3d_refinement_attempted"),
+            ("correspondence_3d_count", "3d_correspondence_count"),
+            ("refinement_3d_inliers", "3d_refinement_inliers"),
+            ("refinement_3d_inlier_ratio", "3d_refinement_inlier_ratio"),
+            (
+                "refinement_3d_relative_improvement",
+                "3d_refinement_relative_improvement",
+            ),
+            ("refinement_3d_accepted", "3d_refinement_accepted"),
+            ("refinement_3d_reason", "3d_refinement_reason"),
+        ):
+            result[external] = result.pop(internal)
+        return result
+
+
+@dataclass(frozen=True)
+class PairAlignmentRecord:
+    previous_frame_index: int
+    current_frame_index: int
+    clouds: PairAlignmentClouds
+    metrics: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -130,6 +211,12 @@ class RelativeMapResult:
     # these avoids a second model inference when report previews are saved.
     preview_image_bgr: np.ndarray
     preview_depth_values: np.ndarray
+    pair_alignment: PairAlignmentRecord | None
+    depth_stabilization_enabled: bool
+    stabilized_raw_fused_point_count: int | None
+    stabilized_voxel_downsampled_point_count: int | None
+    stabilized_fused_cloud: FusedPointCloud | None
+    stabilized_global_filter: GlobalOutlierFilterResult | None
 
 
 class RelativeMapBuilder:
@@ -158,6 +245,8 @@ class RelativeMapBuilder:
         depth_pose_estimator: Any | None = None,
         depth_aligner: Callable[..., Any] = align_prediction_to_pose,
         point_cloud_generator: Callable[..., PointCloudResult] = generate_colored_point_cloud,
+        pose_refiner_3d: RobustPoseRefiner3D | None = None,
+        depth_stabilization: DepthStabilizationConfig | None = None,
     ) -> None:
         if scale_mode not in {"depth-pnp", "fixed-step"}:
             raise ValueError("scale_mode must be 'depth-pnp' or 'fixed-step'")
@@ -197,6 +286,10 @@ class RelativeMapBuilder:
         self.keyframe_selector = keyframe_selector or KeyframeSelector()
         self.depth_aligner = depth_aligner
         self.point_cloud_generator = point_cloud_generator
+        self.pose_refiner_3d = pose_refiner_3d or RobustPoseRefiner3D(
+            PoseRefinement3DConfig(enabled=False)
+        )
+        self.depth_stabilization = depth_stabilization or DepthStabilizationConfig()
         self._stage_timings: dict[str, float] = {}
 
     def _add_timing(self, name: str, seconds: float) -> None:
@@ -302,6 +395,30 @@ class RelativeMapBuilder:
         }
 
     @staticmethod
+    def _refinement_diagnostics_not_attempted(reason: str) -> dict[str, Any]:
+        return {
+            "refinement_3d_attempted": False,
+            "correspondence_3d_count": 0,
+            "refinement_3d_inliers": 0,
+            "refinement_3d_inlier_ratio": 0.0,
+            "baseline_3d_residual_median": None,
+            "refined_3d_residual_median": None,
+            "baseline_3d_residual_rmse": None,
+            "refined_3d_residual_rmse": None,
+            "refinement_3d_relative_improvement": None,
+            "refinement_3d_accepted": False,
+            "refinement_3d_reason": reason,
+        }
+
+    @staticmethod
+    def _rotation_angle_degrees(rotation: np.ndarray) -> float:
+        matrix = np.asarray(rotation, dtype=np.float64)
+        if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+            raise ValueError("rotation diagnostic requires a finite 3x3 matrix")
+        cosine = np.clip((np.trace(matrix) - 1.0) / 2.0, -1.0, 1.0)
+        return float(np.degrees(np.arccos(cosine)))
+
+    @staticmethod
     def _validate_frame(frame: MappingFrame) -> None:
         if (
             not isinstance(frame.image, np.ndarray)
@@ -318,6 +435,7 @@ class RelativeMapBuilder:
             "feature_motion_seconds": 0.0,
             "depth_inference_seconds": 0.0,
             "pnp_depth_alignment_seconds": 0.0,
+            "pose_refinement_3d_seconds": 0.0,
             "point_cloud_fusion_seconds": 0.0,
         }
         iterator = iter(frames)
@@ -329,9 +447,15 @@ class RelativeMapBuilder:
 
         pose_manager = PoseManager()
         fusion = RelativeMapFusion(self.voxel_size)
+        stabilized_fusion = (
+            RelativeMapFusion(self.voxel_size)
+            if self.depth_stabilization.enabled
+            else None
+        )
         statistics: list[FrameMapStatistics] = []
         trajectory_indices = [first.frame_index]
         sampled_count = 1
+        pair_alignment: PairAlignmentRecord | None = None
 
         try:
             first_prediction = self._prediction(first.image)
@@ -340,6 +464,19 @@ class RelativeMapBuilder:
                 denominator_epsilon=self.disparity_denominator_epsilon,
             )
             first_cloud = self._camera_cloud(first.image, first_depth)
+            first_stabilization = stabilize_aligned_depth(
+                first_prediction,
+                first_depth,
+                self.depth_stabilization,
+                sample_stride=self.point_cloud_stride,
+            )
+            first_stabilized_cloud = (
+                self._camera_cloud(
+                    first.image, first_stabilization.stabilized_depth
+                )
+                if stabilized_fusion is not None
+                else None
+            )
             first_quality = measure_depth_alignment_quality(
                 first_depth,
                 alignment_input_correspondences=0,
@@ -349,6 +486,11 @@ class RelativeMapBuilder:
             raise RuntimeError(f"first frame could not initialize the map: {exc}") from exc
         fusion_started = perf_counter()
         fusion.add(first_cloud.points, first_cloud.colors)
+        if stabilized_fusion is not None:
+            assert first_stabilized_cloud is not None
+            stabilized_fusion.add(
+                first_stabilized_cloud.points, first_stabilized_cloud.colors
+            )
         self._add_timing(
             "point_cloud_fusion_seconds", perf_counter() - fusion_started
         )
@@ -367,10 +509,17 @@ class RelativeMapBuilder:
             depth_alignment_method=first_depth.alignment_method,
             cloud_points=first_cloud.valid_point_count,
             camera_position=(0.0, 0.0, 0.0),
+            relative_translation=(0.0, 0.0, 0.0),
+            selected_relative_rotation_deg=0.0,
+            cumulative_rotation_deg=0.0,
+            **asdict(first_stabilization.diagnostics),
             **self._depth_diagnostics(first_depth, first_cloud, first_quality),
         ))
         previous_accepted = first
         previous_depth = first_depth
+        previous_cloud = first_cloud
+        previous_raw_median_z = first_stabilization.diagnostics.raw_z_median
+        previous_raw_p95_z = first_stabilization.diagnostics.raw_z_p95
         frames_since_last_keyframe = 0
 
         for frame in iterator:
@@ -470,6 +619,10 @@ class RelativeMapBuilder:
             keyframe_reason = selection.reason
 
             alignment_inliers = 0
+            refinement_result: PoseRefinement3DResult | None = None
+            refinement_failure: str | None = None
+            baseline_rotation: np.ndarray | None = None
+            baseline_translation: np.ndarray | None = None
             if self.scale_mode == "depth-pnp":
                 pose_started = perf_counter()
                 try:
@@ -595,11 +748,50 @@ class RelativeMapBuilder:
                     ))
                     continue
                 depth_quality = quality_assessment.metrics
-                rotation = scaled_pose.rotation
-                translation = scaled_pose.translation
-                assert rotation is not None and translation is not None
+                baseline_rotation = scaled_pose.rotation
+                baseline_translation = scaled_pose.translation
+                assert baseline_rotation is not None and baseline_translation is not None
+                rotation = baseline_rotation
+                translation = baseline_translation
+                refinement_diagnostic = self._refinement_diagnostics_not_attempted(
+                    "3d_refinement_disabled"
+                )
+                if self.pose_refiner_3d.config.enabled:
+                    refinement_started = perf_counter()
+                    try:
+                        correspondences_3d = build_3d_correspondences(
+                            matches.points1,
+                            matches.points2,
+                            scaled_pose.inlier_mask,
+                            previous_depth,
+                            camera_depth,
+                            self.camera_matrix,
+                        )
+                        refinement_result = self.pose_refiner_3d.refine(
+                            correspondences_3d,
+                            baseline_rotation,
+                            baseline_translation,
+                        )
+                        rotation = refinement_result.selected_rotation
+                        translation = refinement_result.selected_translation
+                        refinement_diagnostic = (
+                            refinement_result.frame_diagnostics()
+                        )
+                    except (RuntimeError, TypeError, ValueError) as exc:
+                        refinement_failure = str(exc)
+                        refinement_diagnostic = {
+                            **self._refinement_diagnostics_not_attempted(
+                                "3d_refinement_invalid_transform"
+                            ),
+                            "refinement_3d_attempted": True,
+                        }
+                    finally:
+                        self._add_timing(
+                            "pose_refinement_3d_seconds",
+                            perf_counter() - refinement_started,
+                        )
                 scale_method = "depth_pnp"
-                pose_diagnostic = diagnostic
+                pose_diagnostic = {**diagnostic, **refinement_diagnostic}
             else:
                 try:
                     depth_inference_executed = True
@@ -631,6 +823,9 @@ class RelativeMapBuilder:
                     translation_units="arbitrary_fixed_step_units",
                     scale_estimation_method=scale_method,
                     depth_representation=prediction.representation,
+                    **self._refinement_diagnostics_not_attempted(
+                        "3d_refinement_not_applicable_fixed_step"
+                    ),
                     **keyframe_diagnostic,
                 )
                 depth_quality = measure_depth_alignment_quality(
@@ -641,6 +836,19 @@ class RelativeMapBuilder:
 
             try:
                 camera_cloud = self._camera_cloud(frame.image, camera_depth)
+                stabilization = stabilize_aligned_depth(
+                    prediction,
+                    camera_depth,
+                    self.depth_stabilization,
+                    sample_stride=self.point_cloud_stride,
+                    previous_median_z=previous_raw_median_z,
+                    previous_p95_z=previous_raw_p95_z,
+                )
+                stabilized_camera_cloud = (
+                    self._camera_cloud(frame.image, stabilization.stabilized_depth)
+                    if stabilized_fusion is not None
+                    else None
+                )
             except (RuntimeError, TypeError, ValueError) as exc:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
@@ -655,21 +863,116 @@ class RelativeMapBuilder:
                 ))
                 continue
 
+            previous_world_pose = pose_manager.current_pose()
             if scale_method == "depth_pnp":
+                assert baseline_rotation is not None and baseline_translation is not None
+                baseline_current_world_pose = PoseManager.compose_world_pose(
+                    previous_world_pose,
+                    baseline_rotation,
+                    baseline_translation,
+                )
                 world_pose = pose_manager.add_scaled_relative_pose(rotation, translation)
+                selected_relative_translation = np.asarray(
+                    translation, dtype=np.float64
+                ).reshape(3)
             else:
+                baseline_current_world_pose = None
                 world_pose = pose_manager.add_fixed_step_relative_pose(
                     rotation, translation, self.translation_step
+                )
+                direction = np.asarray(translation, dtype=np.float64).reshape(3)
+                selected_relative_translation = (
+                    direction / np.linalg.norm(direction) * self.translation_step
+                )
+
+            if (
+                scale_method == "depth_pnp"
+                and self.pose_refiner_3d.config.enabled
+                and pair_alignment is None
+            ):
+                assert baseline_current_world_pose is not None
+                pair_clouds = build_pair_alignment_clouds(
+                    previous_cloud.points,
+                    previous_cloud.colors,
+                    camera_cloud.points,
+                    camera_cloud.colors,
+                    previous_world_pose,
+                    baseline_current_world_pose,
+                    world_pose,
+                )
+                if refinement_result is not None:
+                    pair_metrics = refinement_result.metrics_dict()
+                else:
+                    pair_metrics = {
+                        "transform_convention": "current_from_previous",
+                        "equation": "P_current = R @ P_previous + t",
+                        "coordinate_units": previous_depth.coordinate_units,
+                        "is_metric": previous_depth.is_metric,
+                        "scale_estimation_applied": False,
+                        "applied_scale": 1.0,
+                        "3d_correspondence_count": 0,
+                        "3d_refinement_inliers": 0,
+                        "3d_refinement_inlier_ratio": 0.0,
+                        "baseline_3d_residual": None,
+                        "refined_3d_residual": None,
+                        "3d_refinement_relative_improvement": None,
+                        "pnp_rotation_current_from_previous": baseline_rotation.tolist(),
+                        "pnp_translation_current_from_previous": baseline_translation.tolist(),
+                        "refined_rotation_current_from_previous": None,
+                        "refined_translation_current_from_previous": None,
+                        "selected_rotation_current_from_previous": rotation.tolist(),
+                        "selected_translation_current_from_previous": translation.tolist(),
+                        "3d_refinement_attempted": True,
+                        "3d_refinement_accepted": False,
+                        "3d_refinement_reason": "3d_refinement_invalid_transform",
+                        "error": refinement_failure,
+                    }
+                pair_metrics.update({
+                    "previous_frame_index": previous_accepted.frame_index,
+                    "current_frame_index": frame.frame_index,
+                    "good_matches": good_matches,
+                    "geometric_inliers": geometry_pose.num_inliers,
+                    "pnp_inliers": scaled_pose.pnp_inliers,
+                    "pnp_reprojection_rmse_pixels": (
+                        scaled_pose.reprojection_rmse_pixels
+                    ),
+                    "depth_alignment_inliers": alignment_inliers,
+                    "previous_cloud_point_count": pair_clouds.previous_point_count,
+                    "current_cloud_point_count": pair_clouds.current_point_count,
+                    "pair_cloud_point_count": pair_clouds.before_points.shape[0],
+                    "after_equals_before": not (
+                        refinement_result is not None
+                        and refinement_result.accepted
+                    ),
+                })
+                pair_alignment = PairAlignmentRecord(
+                    previous_frame_index=previous_accepted.frame_index,
+                    current_frame_index=frame.frame_index,
+                    clouds=pair_clouds,
+                    metrics=pair_metrics,
                 )
             fusion_started = perf_counter()
             world_points = transform_points(
                 camera_cloud.points, world_pose[:3, :3], world_pose[:3, 3]
             )
             fusion.add(world_points, camera_cloud.colors)
+            if stabilized_fusion is not None:
+                assert stabilized_camera_cloud is not None
+                stabilized_world_points = transform_points(
+                    stabilized_camera_cloud.points,
+                    world_pose[:3, :3],
+                    world_pose[:3, 3],
+                )
+                stabilized_fusion.add(
+                    stabilized_world_points, stabilized_camera_cloud.colors
+                )
             self._add_timing(
                 "point_cloud_fusion_seconds", perf_counter() - fusion_started
             )
             position = tuple(float(value) for value in world_pose[:3, 3])
+            relative_translation_tuple = tuple(
+                float(value) for value in selected_relative_translation
+            )
             trajectory_indices.append(frame.frame_index)
             statistics.append(FrameMapStatistics(
                 frame_index=frame.frame_index,
@@ -682,6 +985,12 @@ class RelativeMapBuilder:
                 depth_alignment_method=camera_depth.alignment_method,
                 cloud_points=camera_cloud.valid_point_count,
                 camera_position=position,
+                relative_translation=relative_translation_tuple,
+                selected_relative_rotation_deg=self._rotation_angle_degrees(rotation),
+                cumulative_rotation_deg=self._rotation_angle_degrees(
+                    world_pose[:3, :3]
+                ),
+                **asdict(stabilization.diagnostics),
                 **self._depth_diagnostics(
                     camera_depth, camera_cloud, depth_quality
                 ),
@@ -689,6 +998,9 @@ class RelativeMapBuilder:
             ))
             previous_accepted = frame
             previous_depth = camera_depth
+            previous_cloud = camera_cloud
+            previous_raw_median_z = stabilization.diagnostics.raw_z_median
+            previous_raw_p95_z = stabilization.diagnostics.raw_z_p95
             frames_since_last_keyframe = 0
 
         fusion_started = perf_counter()
@@ -713,6 +1025,24 @@ class RelativeMapBuilder:
                 else "arbitrary_fixed_step_units"
             ),
         )
+        stabilized_voxelized: FusedPointCloud | None = None
+        stabilized_global_filter: GlobalOutlierFilterResult | None = None
+        stabilized_fused: FusedPointCloud | None = None
+        if stabilized_fusion is not None:
+            stabilized_voxelized = stabilized_fusion.finalize()
+            stabilized_global_filter = filter_global_radius(
+                stabilized_voxelized.points,
+                stabilized_voxelized.colors,
+                self.global_outlier_percentile,
+            )
+            stabilized_fused = FusedPointCloud(
+                points=stabilized_global_filter.points,
+                colors=stabilized_global_filter.colors,
+                input_point_count=stabilized_fusion.raw_point_count,
+                output_point_count=stabilized_global_filter.output_count,
+                voxel_size=self.voxel_size,
+                coordinate_units=fused.coordinate_units,
+            )
         accepted_count = sum(item.accepted for item in statistics)
         skipped_count = sum(
             item.status == "skipped_non_keyframe" for item in statistics
@@ -753,4 +1083,18 @@ class RelativeMapBuilder:
             stage_timings=dict(self._stage_timings),
             preview_image_bgr=first.image.copy(),
             preview_depth_values=first_prediction.values.copy(),
+            pair_alignment=pair_alignment,
+            depth_stabilization_enabled=self.depth_stabilization.enabled,
+            stabilized_raw_fused_point_count=(
+                None
+                if stabilized_fusion is None
+                else stabilized_fusion.raw_point_count
+            ),
+            stabilized_voxel_downsampled_point_count=(
+                None
+                if stabilized_voxelized is None
+                else stabilized_voxelized.output_point_count
+            ),
+            stabilized_fused_cloud=stabilized_fused,
+            stabilized_global_filter=stabilized_global_filter,
         )
