@@ -862,6 +862,93 @@ This remains monocular relative depth, not metric depth. Tail removal is a
 robustness heuristic that may reduce smearing from unstable aligned-depth
 tails; it does not correct pose drift or prove geometric accuracy.
 
+## Experimental temporal depth normalization
+
+`--temporal-depth-normalization` enables a separate depth-only comparison
+fusion. It is disabled by default. For existing PnP/geometric inlier matches
+between consecutive accepted keyframes, it robustly estimates
+`log(Z_previous) - log(Z_current)`, rejects log-ratio outliers with MAD, and
+uses `exp(median(retained_log_ratios))` as a pairwise multiplicative scale.
+Original aligned Z, affine alignment `a/b`, poses, keyframes, and the baseline
+map remain unchanged.
+
+Normalization is accepted only when correspondence count, robust inliers,
+inlier ratio, scale range, log-MAD dispersion, and cumulative-scale guard all
+pass. A rejection uses the original current depth exactly. Pairwise scale is
+applied only to the current frame; the cumulative product is recorded and
+guarded but is not blindly applied as a global scale.
+
+```powershell
+py tools\run_relative_map.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 15 --max-candidate-frames 3 --point-cloud-stride 4 --device cpu --keyframes --temporal-depth-normalization --no-depth-stabilization --no-pose-refinement-3d
+```
+
+When enabled, the run saves direct baseline/normalized scientific comparisons:
+
+```text
+global_relative_map_baseline.ply
+global_relative_map_temporal_normalized.ply
+global_map_baseline_{front,oblique,top}.png
+global_map_temporal_normalized_{front,oblique,top}.png
+```
+
+`frame_stats.jsonl` records pairwise/cumulative scale, counts, inlier ratio,
+log-ratio MAD, original/normalized Z percentiles, and fixed-pose matched-3D
+residuals before and after normalization. `metadata.json` records both maps'
+point counts and X/Y/Z percentile summaries. Both branches use identical
+accepted keyframes, poses, stride, fusion, voxel, and scientific filtering.
+
+This experiment remains relative and non-metric and does not recover true
+scale. It assumes matched scene structure should have locally consistent
+relative depth, although actual camera motion changes camera-frame Z. Moving
+objects, weak matches, and occlusion can bias the estimate. Normalization does
+not correct pose error, and improved overlap does not prove geometric accuracy.
+
+## Diagnostic-only pose-chain consistency
+
+The optional `--pose-chain-diagnostics` check compares each accepted chained
+pose with an independent pose estimated directly from the first accepted
+keyframe. It is disabled by default. Dedicated SIFT, Essential-Matrix, and
+depth-assisted PnP objects run only after mapping has finished, so these extra
+estimates cannot alter feature tracking, pose accumulation, keyframes, depth,
+fusion, or quality gates.
+
+Transform directions are explicit. PnP returns
+`T_current_reference`, following `X_current = R @ X_reference + t`. The mapper
+stores `T_world_camera`, so the direct relative transform is inverted and
+right-composed with `T_world_reference`, exactly as in `PoseManager`. Rotation
+disagreement is the angle of `R_direct^T @ R_chained`.
+
+```powershell
+py tools\run_relative_map.py data\drone_new.mp4 --fx 800 --fy 800 --cx 636 --cy 321 --sample-every 5 --max-candidate-frames 30 --point-cloud-stride 8 --device cpu --keyframes --pose-chain-diagnostics --no-depth-stabilization --no-pose-refinement-3d
+```
+
+Outputs are written beneath the same relative-map run:
+
+```text
+pose_chain_diagnostics/
+|-- pose_chain_diagnostics.csv
+|-- pose_chain_diagnostics.json
+|-- pose_chain_summary.json
+|-- translation_difference_vs_frame.png
+|-- relative_translation_difference_vs_frame.png
+|-- rotation_difference_vs_frame.png
+|-- chained_vs_direct_distance.png
+|-- chained_vs_direct_xz.png
+|-- chained_vs_direct_xy.png
+`-- pose_chain_overview.png
+```
+
+Each row records direct-pose availability, quality, confidence, chained/direct
+camera centers, and translation/rotation disagreement. Summary statistics and
+heuristic drift flags use only high-confidence direct poses and explicitly make
+no statistical-significance claim. A failed or unreliable direct estimate is
+retained as unavailable or low-confidence rather than forced into a drift
+conclusion.
+
+This diagnostic remains relative and non-metric. Direct-versus-chained
+disagreement can support a pose-drift hypothesis, but the direct estimates are
+not ground truth and cannot prove global geometric accuracy.
+
 ## Stage 6: visual keyframe selection
 
 A keyframe is a candidate image selected to contribute a pose and dense cloud

@@ -5,6 +5,7 @@ import numpy as np
 
 from src.depth_alignment import DepthAlignmentResult
 from src.depth_stabilization import DepthStabilizationConfig
+from src.temporal_depth_normalization import TemporalDepthNormalizationConfig
 from src.map_builder import MappingFrame, RelativeMapBuilder
 from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.depth_types import CameraDepth, DepthPrediction
@@ -89,6 +90,7 @@ class SuccessfulDepthPoseEstimator:
             translation_units="relative_depth_units",
             rotation=np.eye(3),
             translation=np.array([0.1, 0.0, 0.0]),
+            inlier_mask=np.ones(8, dtype=bool),
         )
 
 
@@ -252,6 +254,40 @@ class MapBuilderTests(unittest.TestCase):
         self.assertTrue(
             result.frame_statistics[0].depth_stabilization_accepted
         )
+
+    def test_temporal_normalization_preserves_keyframes_and_pose_chain(self) -> None:
+        def make_builder(temporal=None):
+            return RelativeMapBuilder(
+                depth_estimator=FakeDepthEstimator(),
+                feature_tracker=FakeFeatureTracker(),
+                motion_estimator=SuccessfulGeometryEstimator(),
+                depth_pose_estimator=SuccessfulDepthPoseEstimator(),
+                depth_aligner=AlwaysAcceptAligner(),
+                camera_matrix=np.eye(3),
+                keyframe_selector=disabled_keyframes(),
+                point_cloud_stride=1,
+                voxel_size=0.1,
+                temporal_depth_normalization=temporal,
+            )
+
+        baseline = make_builder().build([self.frame(0), self.frame(1)])
+        experimental = make_builder(TemporalDepthNormalizationConfig(
+            enabled=True,
+            minimum_correspondences=4,
+            minimum_inliers=3,
+        )).build([self.frame(0), self.frame(1)])
+
+        np.testing.assert_array_equal(
+            experimental.trajectory_frame_indices,
+            baseline.trajectory_frame_indices,
+        )
+        np.testing.assert_array_equal(
+            experimental.trajectory_positions, baseline.trajectory_positions
+        )
+        np.testing.assert_array_equal(
+            experimental.fused_cloud.points, baseline.fused_cloud.points
+        )
+        self.assertIsNotNone(experimental.temporal_normalized_fused_cloud)
 
     def test_rejected_motion_adds_neither_pose_nor_cloud(self) -> None:
         depth = FakeDepthEstimator()

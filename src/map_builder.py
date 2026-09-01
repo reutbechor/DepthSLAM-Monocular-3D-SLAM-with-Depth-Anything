@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from time import perf_counter
 from typing import Any, Callable, Iterable
 
@@ -28,6 +28,7 @@ from .keyframe_selector import KeyframeSelectionResult, KeyframeSelector
 from .map_fusion import FusedPointCloud, RelativeMapFusion
 from .point_cloud import PointCloudResult, generate_colored_point_cloud
 from .pose_manager import PoseManager
+from .pose_chain_diagnostics import PoseChainFrameInput
 from .pose_refinement_3d import (
     PairAlignmentClouds,
     PoseRefinement3DConfig,
@@ -37,6 +38,12 @@ from .pose_refinement_3d import (
     build_pair_alignment_clouds,
 )
 from .robust_filtering import GlobalOutlierFilterResult, filter_global_radius
+from .temporal_depth_normalization import (
+    TemporalDepthNormalizationConfig,
+    matched_world_residual_statistics,
+    normalize_temporal_depth,
+    reference_temporal_depth_result,
+)
 from .transforms import transform_points
 
 
@@ -150,6 +157,35 @@ class FrameMapStatistics:
     robust_upper_z_limit: float | None = None
     ratio_upper_z_limit: float | None = None
     mad_upper_z_limit: float | None = None
+    temporal_depth_normalization_attempted: bool = False
+    temporal_depth_normalization_accepted: bool = False
+    temporal_depth_normalization_reason: str | None = None
+    temporal_depth_correspondence_count: int = 0
+    temporal_depth_valid_ratio_count: int = 0
+    temporal_depth_inlier_count: int = 0
+    temporal_depth_inlier_ratio: float = 0.0
+    temporal_depth_raw_ratio_median: float | None = None
+    temporal_depth_ratio_p05: float | None = None
+    temporal_depth_ratio_p50: float | None = None
+    temporal_depth_ratio_p95: float | None = None
+    temporal_depth_scale_pairwise: float | None = None
+    temporal_depth_scale_cumulative: float = 1.0
+    temporal_depth_scale_cumulative_candidate: float | None = None
+    temporal_depth_log_ratio_median: float | None = None
+    temporal_depth_log_ratio_mad: float | None = None
+    original_z_median: float | None = None
+    normalized_z_median: float | None = None
+    original_z_p95: float | None = None
+    normalized_z_p95: float | None = None
+    original_z_p99: float | None = None
+    normalized_z_p99: float | None = None
+    temporal_original_alignment_a: float | None = None
+    temporal_original_alignment_b: float | None = None
+    temporal_residual_correspondence_count: int = 0
+    temporal_residual_before_median: float | None = None
+    temporal_residual_before_rmse: float | None = None
+    temporal_residual_after_median: float | None = None
+    temporal_residual_after_rmse: float | None = None
 
     def __post_init__(self) -> None:
         valid_statuses = {"accepted_keyframe", "skipped_non_keyframe", "rejected"}
@@ -217,6 +253,12 @@ class RelativeMapResult:
     stabilized_voxel_downsampled_point_count: int | None
     stabilized_fused_cloud: FusedPointCloud | None
     stabilized_global_filter: GlobalOutlierFilterResult | None
+    pose_chain_frames: tuple[PoseChainFrameInput, ...] | None
+    temporal_depth_normalization_enabled: bool
+    temporal_normalized_raw_fused_point_count: int | None
+    temporal_normalized_voxel_downsampled_point_count: int | None
+    temporal_normalized_fused_cloud: FusedPointCloud | None
+    temporal_normalized_global_filter: GlobalOutlierFilterResult | None
 
 
 class RelativeMapBuilder:
@@ -247,6 +289,8 @@ class RelativeMapBuilder:
         point_cloud_generator: Callable[..., PointCloudResult] = generate_colored_point_cloud,
         pose_refiner_3d: RobustPoseRefiner3D | None = None,
         depth_stabilization: DepthStabilizationConfig | None = None,
+        capture_pose_chain_diagnostics: bool = False,
+        temporal_depth_normalization: TemporalDepthNormalizationConfig | None = None,
     ) -> None:
         if scale_mode not in {"depth-pnp", "fixed-step"}:
             raise ValueError("scale_mode must be 'depth-pnp' or 'fixed-step'")
@@ -290,6 +334,10 @@ class RelativeMapBuilder:
             PoseRefinement3DConfig(enabled=False)
         )
         self.depth_stabilization = depth_stabilization or DepthStabilizationConfig()
+        self.capture_pose_chain_diagnostics = bool(capture_pose_chain_diagnostics)
+        self.temporal_depth_normalization = (
+            temporal_depth_normalization or TemporalDepthNormalizationConfig()
+        )
         self._stage_timings: dict[str, float] = {}
 
     def _add_timing(self, name: str, seconds: float) -> None:
@@ -452,10 +500,18 @@ class RelativeMapBuilder:
             if self.depth_stabilization.enabled
             else None
         )
+        temporal_normalized_fusion = (
+            RelativeMapFusion(self.voxel_size)
+            if self.temporal_depth_normalization.enabled
+            else None
+        )
         statistics: list[FrameMapStatistics] = []
         trajectory_indices = [first.frame_index]
         sampled_count = 1
         pair_alignment: PairAlignmentRecord | None = None
+        pose_chain_frames: list[PoseChainFrameInput] | None = (
+            [] if self.capture_pose_chain_diagnostics else None
+        )
 
         try:
             first_prediction = self._prediction(first.image)
@@ -477,6 +533,16 @@ class RelativeMapBuilder:
                 if stabilized_fusion is not None
                 else None
             )
+            first_temporal_normalization = reference_temporal_depth_result(
+                first_depth
+            )
+            first_temporal_cloud = (
+                self._camera_cloud(
+                    first.image, first_temporal_normalization.normalized_depth
+                )
+                if temporal_normalized_fusion is not None
+                else None
+            )
             first_quality = measure_depth_alignment_quality(
                 first_depth,
                 alignment_input_correspondences=0,
@@ -490,6 +556,11 @@ class RelativeMapBuilder:
             assert first_stabilized_cloud is not None
             stabilized_fusion.add(
                 first_stabilized_cloud.points, first_stabilized_cloud.colors
+            )
+        if temporal_normalized_fusion is not None:
+            assert first_temporal_cloud is not None
+            temporal_normalized_fusion.add(
+                first_temporal_cloud.points, first_temporal_cloud.colors
             )
         self._add_timing(
             "point_cloud_fusion_seconds", perf_counter() - fusion_started
@@ -513,6 +584,7 @@ class RelativeMapBuilder:
             selected_relative_rotation_deg=0.0,
             cumulative_rotation_deg=0.0,
             **asdict(first_stabilization.diagnostics),
+            **asdict(first_temporal_normalization.diagnostics),
             **self._depth_diagnostics(first_depth, first_cloud, first_quality),
         ))
         previous_accepted = first
@@ -520,6 +592,14 @@ class RelativeMapBuilder:
         previous_cloud = first_cloud
         previous_raw_median_z = first_stabilization.diagnostics.raw_z_median
         previous_raw_p95_z = first_stabilization.diagnostics.raw_z_p95
+        previous_temporal_cumulative_scale = 1.0
+        if pose_chain_frames is not None:
+            pose_chain_frames.append(PoseChainFrameInput(
+                frame_index=first.frame_index,
+                image_bgr=first.image.copy(),
+                camera_depth=replace(first_depth, values=first_depth.values.copy()),
+                world_from_camera=np.eye(4, dtype=np.float64),
+            ))
         frames_since_last_keyframe = 0
 
         for frame in iterator:
@@ -834,6 +914,8 @@ class RelativeMapBuilder:
                     alignment_inliers=0,
                 )
 
+            temporal_normalization = None
+            normalized_camera_cloud = None
             try:
                 camera_cloud = self._camera_cloud(frame.image, camera_depth)
                 stabilization = stabilize_aligned_depth(
@@ -849,6 +931,26 @@ class RelativeMapBuilder:
                     if stabilized_fusion is not None
                     else None
                 )
+                if temporal_normalized_fusion is not None:
+                    temporal_match_mask = (
+                        scaled_pose.inlier_mask
+                        if scale_method == "depth_pnp"
+                        else geometry_pose.inlier_mask
+                    )
+                    temporal_normalization = normalize_temporal_depth(
+                        matches.points1,
+                        matches.points2,
+                        temporal_match_mask,
+                        previous_depth,
+                        camera_depth,
+                        self.temporal_depth_normalization,
+                        previous_cumulative_scale=(
+                            previous_temporal_cumulative_scale
+                        ),
+                    )
+                    normalized_camera_cloud = self._camera_cloud(
+                        frame.image, temporal_normalization.normalized_depth
+                    )
             except (RuntimeError, TypeError, ValueError) as exc:
                 statistics.append(FrameMapStatistics(
                     frame.frame_index, frame.timestamp_seconds, False,
@@ -966,6 +1068,49 @@ class RelativeMapBuilder:
                 stabilized_fusion.add(
                     stabilized_world_points, stabilized_camera_cloud.colors
                 )
+            if temporal_normalized_fusion is not None:
+                assert temporal_normalization is not None
+                assert normalized_camera_cloud is not None
+                normalized_world_points = transform_points(
+                    normalized_camera_cloud.points,
+                    world_pose[:3, :3],
+                    world_pose[:3, 3],
+                )
+                temporal_normalized_fusion.add(
+                    normalized_world_points, normalized_camera_cloud.colors
+                )
+                before_residual = matched_world_residual_statistics(
+                    matches.points1,
+                    matches.points2,
+                    temporal_normalization.retained_match_mask,
+                    previous_depth,
+                    camera_depth,
+                    self.camera_matrix,
+                    previous_world_pose,
+                    world_pose,
+                )
+                after_residual = matched_world_residual_statistics(
+                    matches.points1,
+                    matches.points2,
+                    temporal_normalization.retained_match_mask,
+                    previous_depth,
+                    temporal_normalization.normalized_depth,
+                    self.camera_matrix,
+                    previous_world_pose,
+                    world_pose,
+                )
+                temporal_diagnostics = replace(
+                    temporal_normalization.diagnostics,
+                    temporal_residual_correspondence_count=int(
+                        before_residual["count"]
+                    ),
+                    temporal_residual_before_median=before_residual["median"],
+                    temporal_residual_before_rmse=before_residual["rmse"],
+                    temporal_residual_after_median=after_residual["median"],
+                    temporal_residual_after_rmse=after_residual["rmse"],
+                )
+            else:
+                temporal_diagnostics = None
             self._add_timing(
                 "point_cloud_fusion_seconds", perf_counter() - fusion_started
             )
@@ -991,6 +1136,7 @@ class RelativeMapBuilder:
                     world_pose[:3, :3]
                 ),
                 **asdict(stabilization.diagnostics),
+                **({} if temporal_diagnostics is None else asdict(temporal_diagnostics)),
                 **self._depth_diagnostics(
                     camera_depth, camera_cloud, depth_quality
                 ),
@@ -1001,6 +1147,19 @@ class RelativeMapBuilder:
             previous_cloud = camera_cloud
             previous_raw_median_z = stabilization.diagnostics.raw_z_median
             previous_raw_p95_z = stabilization.diagnostics.raw_z_p95
+            if temporal_diagnostics is not None:
+                previous_temporal_cumulative_scale = (
+                    temporal_diagnostics.temporal_depth_scale_cumulative
+                )
+            if pose_chain_frames is not None:
+                pose_chain_frames.append(PoseChainFrameInput(
+                    frame_index=frame.frame_index,
+                    image_bgr=frame.image.copy(),
+                    camera_depth=replace(
+                        camera_depth, values=camera_depth.values.copy()
+                    ),
+                    world_from_camera=world_pose.copy(),
+                ))
             frames_since_last_keyframe = 0
 
         fusion_started = perf_counter()
@@ -1040,6 +1199,24 @@ class RelativeMapBuilder:
                 colors=stabilized_global_filter.colors,
                 input_point_count=stabilized_fusion.raw_point_count,
                 output_point_count=stabilized_global_filter.output_count,
+                voxel_size=self.voxel_size,
+                coordinate_units=fused.coordinate_units,
+            )
+        temporal_voxelized: FusedPointCloud | None = None
+        temporal_global_filter: GlobalOutlierFilterResult | None = None
+        temporal_fused: FusedPointCloud | None = None
+        if temporal_normalized_fusion is not None:
+            temporal_voxelized = temporal_normalized_fusion.finalize()
+            temporal_global_filter = filter_global_radius(
+                temporal_voxelized.points,
+                temporal_voxelized.colors,
+                self.global_outlier_percentile,
+            )
+            temporal_fused = FusedPointCloud(
+                points=temporal_global_filter.points,
+                colors=temporal_global_filter.colors,
+                input_point_count=temporal_normalized_fusion.raw_point_count,
+                output_point_count=temporal_global_filter.output_count,
                 voxel_size=self.voxel_size,
                 coordinate_units=fused.coordinate_units,
             )
@@ -1097,4 +1274,22 @@ class RelativeMapBuilder:
             ),
             stabilized_fused_cloud=stabilized_fused,
             stabilized_global_filter=stabilized_global_filter,
+            pose_chain_frames=(
+                None if pose_chain_frames is None else tuple(pose_chain_frames)
+            ),
+            temporal_depth_normalization_enabled=(
+                self.temporal_depth_normalization.enabled
+            ),
+            temporal_normalized_raw_fused_point_count=(
+                None
+                if temporal_normalized_fusion is None
+                else temporal_normalized_fusion.raw_point_count
+            ),
+            temporal_normalized_voxel_downsampled_point_count=(
+                None
+                if temporal_voxelized is None
+                else temporal_voxelized.output_point_count
+            ),
+            temporal_normalized_fused_cloud=temporal_fused,
+            temporal_normalized_global_filter=temporal_global_filter,
         )

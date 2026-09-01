@@ -291,6 +291,47 @@ def save_depth_stabilization_comparison(
     return paths
 
 
+def save_temporal_depth_normalization_comparison(
+    directory: str | Path,
+    baseline_points: np.ndarray,
+    baseline_colors: np.ndarray,
+    normalized_points: np.ndarray,
+    normalized_colors: np.ndarray,
+    *,
+    preview_max_points: int = 40_000,
+) -> dict[str, Path]:
+    """Save matched baseline/normalized maps without display-only filtering."""
+
+    output = Path(directory)
+    paths = {
+        "baseline_ply": output / "global_relative_map_baseline.ply",
+        "temporal_normalized_ply": (
+            output / "global_relative_map_temporal_normalized.ply"
+        ),
+    }
+    write_ascii_ply(paths["baseline_ply"], baseline_points, baseline_colors)
+    write_ascii_ply(
+        paths["temporal_normalized_ply"], normalized_points, normalized_colors
+    )
+    for variant, points, colors in (
+        ("baseline", baseline_points, baseline_colors),
+        ("temporal_normalized", normalized_points, normalized_colors),
+    ):
+        title = (
+            "Baseline relative map (non-metric)"
+            if variant == "baseline"
+            else "Temporal-normalized relative map (non-metric)"
+        )
+        for view in ("front", "oblique", "top"):
+            key = f"{variant}_{view}"
+            paths[key] = output / f"global_map_{variant}_{view}.png"
+            save_point_cloud_preview(
+                paths[key], points, colors, view=view, title=title,
+                max_points=preview_max_points,
+            )
+    return paths
+
+
 def save_cloud_visual_artifacts(
     directory: str | Path,
     points: np.ndarray,

@@ -97,6 +97,19 @@ depth_stabilization:
   # Fall back to the original depth map instead of removing too many samples.
   maximum_removed_ratio: 0.20
 
+temporal_depth_normalization:
+  # Optional pairwise relative-Z scale experiment; never changes mapper poses.
+  enabled: false
+  minimum_correspondences: 200
+  minimum_inliers: 150
+  minimum_inlier_ratio: 0.50
+  minimum_scale: 0.70
+  maximum_scale: 1.30
+  maximum_log_mad: 0.25
+  minimum_cumulative_scale: 0.50
+  maximum_cumulative_scale: 2.0
+  log_mad_outlier_multiplier: 3.5
+
 trajectory_refinement:
   # Stage 8 is opt-in and never overwrites the raw accepted-pose trajectory.
   enabled: false
@@ -123,6 +136,18 @@ visual_output:
 diagnostics:
   # Read-only accepted-keyframe drift tables and plots; never affects mapping.
   save_drift_diagnostics: true
+
+pose_chain_diagnostics:
+  # Isolated direct reference-to-keyframe SIFT/Essential/PnP checks.
+  enabled: false
+  # Direct estimates below these existing-quality levels are low confidence.
+  minimum_geometric_inlier_ratio: 0.25
+  minimum_pnp_inlier_ratio: 0.25
+  maximum_reprojection_rmse_pixels: 3.0
+  # Heuristic-only drift flags; these never reject or alter mapper poses.
+  translation_relative_difference_threshold: 0.25
+  rotation_difference_threshold_deg: 5.0
+  increasing_fraction_threshold: 0.70
 
 output:
   directory: outputs

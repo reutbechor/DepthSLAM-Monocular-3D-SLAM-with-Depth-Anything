@@ -32,16 +32,26 @@ from src.depth_stabilization import DepthStabilizationConfig
 from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.map_builder import MappingFrame, RelativeMapBuilder, RelativeMapResult
 from src.ply_io import write_ascii_ply
+from src.pose_chain_diagnostics import (
+    PoseChainDiagnosticConfig,
+    PoseChainDiagnosticRow,
+    ReferenceDirectPoseEstimator,
+    analyze_pose_chain,
+    save_pose_chain_diagnostics,
+)
 from src.pose_refinement_3d import (
     PoseRefinement3DConfig,
     RobustPoseRefiner3D,
 )
+from src.robust_filtering import coordinate_statistics
+from src.temporal_depth_normalization import TemporalDepthNormalizationConfig
 from src.video_loader import VideoLoader
 from src.visual_outputs import (
     CloudVisualArtifacts,
     display_cleaning_metadata,
     save_cloud_visual_artifacts,
     save_depth_stabilization_comparison,
+    save_temporal_depth_normalization_comparison,
     save_map_overview_panel,
     save_point_cloud_preview,
     save_trajectory_previews,
@@ -138,6 +148,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable experimental post-alignment relative-Z tail rejection",
     )
     parser.add_argument(
+        "--temporal-depth-normalization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable experimental pairwise aligned-depth scale normalization",
+    )
+    parser.add_argument(
         "--save-previews",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -154,6 +170,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Save diagnostic-only accepted-keyframe drift tables and plots",
+    )
+    parser.add_argument(
+        "--pose-chain-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Estimate diagnostic-only direct reference-to-keyframe poses",
     )
     parser.add_argument("--ratio-threshold", type=float)
     parser.add_argument("--max-features", type=int)
@@ -308,6 +330,58 @@ def save_optional_drift_diagnostics(
     return drift
 
 
+def save_optional_pose_chain_diagnostics(
+    directory: Path,
+    metadata: dict[str, Any],
+    rows: list[PoseChainDiagnosticRow] | None,
+    config: PoseChainDiagnosticConfig,
+) -> dict[str, Any] | None:
+    """Write isolated direct-pose diagnostics without changing mapping data."""
+
+    if rows is None:
+        metadata["pose_chain_diagnostics"] = {"enabled": False}
+        return None
+    result = save_pose_chain_diagnostics(directory, rows, config)
+    metadata["pose_chain_diagnostics"] = {
+        "enabled": True,
+        "diagnostic_only": True,
+        "directory": Path(result["directory"]).name,
+        "csv": Path(result["csv"]).name,
+        "json": Path(result["json"]).name,
+        "summary": Path(result["summary_path"]).name,
+        "plots": [Path(path).name for path in result["plots"]],
+        "quality_thresholds": {
+            "minimum_geometric_inlier_ratio": (
+                config.minimum_geometric_inlier_ratio
+            ),
+            "minimum_pnp_inlier_ratio": config.minimum_pnp_inlier_ratio,
+            "maximum_reprojection_rmse_pixels": (
+                config.maximum_reprojection_rmse_pixels
+            ),
+        },
+        "results": result["summary"],
+    }
+    return result
+
+
+def temporal_map_statistics(points: np.ndarray) -> dict[str, Any]:
+    """Return relative/non-metric axis summaries for a comparison map."""
+
+    statistics = coordinate_statistics(points)
+    z = statistics["z"]
+    median = z["median"]
+    return {
+        "coordinate_scale": "relative_non_metric",
+        "axis_percentiles": statistics,
+        "z_median": median,
+        "z_p95": z["p95"],
+        "z_p99": z["p99"],
+        "z_p99_over_median": (
+            None if median == 0.0 else float(z["p99"] / abs(median))
+        ),
+    }
+
+
 def save_outputs(
     directory: Path,
     result: RelativeMapResult,
@@ -317,6 +391,8 @@ def save_outputs(
     save_previews: bool,
     save_display_clean: bool,
     save_drift: bool,
+    pose_chain_rows: list[PoseChainDiagnosticRow] | None,
+    pose_chain_config: PoseChainDiagnosticConfig,
 ) -> tuple[Path, CloudVisualArtifacts]:
     np.save(directory / "global_points_relative.npy", result.fused_cloud.points)
     np.save(directory / "global_colors_rgb.npy", result.fused_cloud.colors)
@@ -408,8 +484,51 @@ def save_outputs(
         })
     else:
         metadata["depth_stabilization"]["comparison_artifacts"] = None
+    if result.temporal_depth_normalization_enabled:
+        if result.temporal_normalized_fused_cloud is None:
+            raise RuntimeError(
+                "enabled temporal normalization produced no comparison map"
+            )
+        temporal_artifacts = save_temporal_depth_normalization_comparison(
+            directory,
+            result.fused_cloud.points,
+            result.fused_cloud.colors,
+            result.temporal_normalized_fused_cloud.points,
+            result.temporal_normalized_fused_cloud.colors,
+            preview_max_points=int(visual_config.get("preview_max_points", 40_000)),
+        )
+        metadata["temporal_depth_normalization"].update({
+            "comparison_artifacts": {
+                name: path.name for name, path in temporal_artifacts.items()
+            },
+            "same_accepted_keyframes": True,
+            "same_poses": True,
+            "same_fusion_and_voxel_settings": True,
+            "comparison_display_filtering": "none",
+            "baseline": {
+                "fused_input_point_count": result.raw_fused_point_count,
+                "final_point_count": result.fused_cloud.output_point_count,
+                **temporal_map_statistics(result.fused_cloud.points),
+            },
+            "temporal_normalized": {
+                "fused_input_point_count": (
+                    result.temporal_normalized_raw_fused_point_count
+                ),
+                "final_point_count": (
+                    result.temporal_normalized_fused_cloud.output_point_count
+                ),
+                **temporal_map_statistics(
+                    result.temporal_normalized_fused_cloud.points
+                ),
+            },
+        })
+    else:
+        metadata["temporal_depth_normalization"]["comparison_artifacts"] = None
     save_optional_drift_diagnostics(
         directory, result, metadata, enabled=save_drift
+    )
+    save_optional_pose_chain_diagnostics(
+        directory, metadata, pose_chain_rows, pose_chain_config
     )
     with (directory / "metadata.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
@@ -490,6 +609,10 @@ def main() -> int:
         map_config = config.get("map", {})
         pose_refinement_config = config.get("pose_refinement_3d", {})
         depth_stabilization_config = config.get("depth_stabilization", {})
+        pose_chain_config = config.get("pose_chain_diagnostics", {})
+        temporal_normalization_config = config.get(
+            "temporal_depth_normalization", {}
+        )
         visual_config = config.get("visual_output", {})
         diagnostics_config = config.get("diagnostics", {})
         output_config = config.get("output", {})
@@ -500,14 +623,17 @@ def main() -> int:
             map_config,
             pose_refinement_config,
             depth_stabilization_config,
+            pose_chain_config,
+            temporal_normalization_config,
             visual_config,
             diagnostics_config,
             output_config,
         )):
             raise ValueError(
                 "model, motion, keyframes, map, pose_refinement_3d, "
-                "depth_stabilization, visual_output, diagnostics, and output "
-                "config sections must be mappings"
+                "depth_stabilization, temporal_depth_normalization, "
+                "pose_chain_diagnostics, visual_output, diagnostics, and "
+                "output config sections must be mappings"
             )
         camera_matrix = camera_matrix_from_args(args, config)
 
@@ -638,6 +764,87 @@ def main() -> int:
                 "maximum_removed_ratio", 0.20
             )),
         )
+        pose_chain_settings = PoseChainDiagnosticConfig(
+            enabled=bool(setting(
+                args.pose_chain_diagnostics,
+                pose_chain_config,
+                "enabled",
+                False,
+            )),
+            minimum_geometric_inlier_ratio=float(pose_chain_config.get(
+                "minimum_geometric_inlier_ratio",
+                setting(
+                    args.minimum_inlier_ratio,
+                    motion_config,
+                    "minimum_inlier_ratio",
+                    0.25,
+                ),
+            )),
+            minimum_pnp_inlier_ratio=float(pose_chain_config.get(
+                "minimum_pnp_inlier_ratio",
+                setting(
+                    args.minimum_pnp_inlier_ratio,
+                    map_config,
+                    "minimum_pnp_inlier_ratio",
+                    0.25,
+                ),
+            )),
+            maximum_reprojection_rmse_pixels=float(pose_chain_config.get(
+                "maximum_reprojection_rmse_pixels",
+                setting(
+                    args.pnp_reprojection_error,
+                    map_config,
+                    "pnp_reprojection_error_pixels",
+                    3.0,
+                ),
+            )),
+            translation_relative_difference_threshold=float(
+                pose_chain_config.get(
+                    "translation_relative_difference_threshold", 0.25
+                )
+            ),
+            rotation_difference_threshold_deg=float(pose_chain_config.get(
+                "rotation_difference_threshold_deg", 5.0
+            )),
+            increasing_fraction_threshold=float(pose_chain_config.get(
+                "increasing_fraction_threshold", 0.70
+            )),
+        )
+        temporal_normalization_settings = TemporalDepthNormalizationConfig(
+            enabled=bool(setting(
+                args.temporal_depth_normalization,
+                temporal_normalization_config,
+                "enabled",
+                False,
+            )),
+            minimum_correspondences=int(temporal_normalization_config.get(
+                "minimum_correspondences", 200
+            )),
+            minimum_inliers=int(temporal_normalization_config.get(
+                "minimum_inliers", 150
+            )),
+            minimum_inlier_ratio=float(temporal_normalization_config.get(
+                "minimum_inlier_ratio", 0.50
+            )),
+            minimum_scale=float(temporal_normalization_config.get(
+                "minimum_scale", 0.70
+            )),
+            maximum_scale=float(temporal_normalization_config.get(
+                "maximum_scale", 1.30
+            )),
+            maximum_log_mad=float(temporal_normalization_config.get(
+                "maximum_log_mad", 0.25
+            )),
+            minimum_cumulative_scale=float(temporal_normalization_config.get(
+                "minimum_cumulative_scale", 0.50
+            )),
+            maximum_cumulative_scale=float(temporal_normalization_config.get(
+                "maximum_cumulative_scale", 2.0
+            )),
+            log_mad_outlier_multiplier=float(temporal_normalization_config.get(
+                "log_mad_outlier_multiplier", 3.5
+            )),
+        )
         keyframe_thresholds = KeyframeThresholds(
             enabled=keyframes_enabled,
             min_good_matches=keyframe_config.get("min_good_matches", 100),
@@ -719,8 +926,50 @@ def main() -> int:
             ),
             pose_refiner_3d=RobustPoseRefiner3D(refinement_3d_settings),
             depth_stabilization=depth_stabilization_settings,
+            capture_pose_chain_diagnostics=pose_chain_settings.enabled,
+            temporal_depth_normalization=temporal_normalization_settings,
         )
         result = builder.build(selected_frames)
+        pose_chain_rows: list[PoseChainDiagnosticRow] | None = None
+        pose_chain_runtime_seconds = 0.0
+        if pose_chain_settings.enabled:
+            if result.pose_chain_frames is None:
+                raise RuntimeError("pose-chain diagnostic inputs were not captured")
+            direct_started = perf_counter()
+            direct_estimator = ReferenceDirectPoseEstimator(
+                build_tracker(args, motion_config),
+                build_motion_estimator(args, motion_config),
+                DepthPoseEstimator(
+                    minimum_correspondences=int(map_config.get(
+                        "minimum_pnp_correspondences", 6
+                    )),
+                    minimum_inliers=int(setting(
+                        args.minimum_pnp_inliers,
+                        map_config,
+                        "minimum_pnp_inliers",
+                        6,
+                    )),
+                    minimum_inlier_ratio=float(setting(
+                        args.minimum_pnp_inlier_ratio,
+                        map_config,
+                        "minimum_pnp_inlier_ratio",
+                        0.25,
+                    )),
+                    reprojection_error_pixels=float(setting(
+                        args.pnp_reprojection_error,
+                        map_config,
+                        "pnp_reprojection_error_pixels",
+                        3.0,
+                    )),
+                ),
+                camera_matrix,
+            )
+            pose_chain_rows = analyze_pose_chain(
+                result.pose_chain_frames,
+                direct_estimator,
+                pose_chain_settings,
+            )
+            pose_chain_runtime_seconds = perf_counter() - direct_started
         total_pipeline_runtime = perf_counter() - pipeline_started
 
         output_root = args.output_dir or Path(output_config.get("directory", "outputs"))
@@ -881,6 +1130,58 @@ def main() -> int:
                     "make depth metric, correct pose drift, or prove accuracy."
                 ),
             },
+            "temporal_depth_normalization": {
+                "enabled": temporal_normalization_settings.enabled,
+                "experimental": True,
+                "method": "pairwise_robust_log_depth_ratio",
+                "aligned_depth_original_preserved": True,
+                "normalized_depth_label": (
+                    "aligned_depth_temporally_normalized"
+                ),
+                "changes_pose": False,
+                "coordinate_scale": "relative_non_metric",
+                "minimum_correspondences": (
+                    temporal_normalization_settings.minimum_correspondences
+                ),
+                "minimum_inliers": temporal_normalization_settings.minimum_inliers,
+                "minimum_inlier_ratio": (
+                    temporal_normalization_settings.minimum_inlier_ratio
+                ),
+                "minimum_scale": temporal_normalization_settings.minimum_scale,
+                "maximum_scale": temporal_normalization_settings.maximum_scale,
+                "maximum_log_mad": (
+                    temporal_normalization_settings.maximum_log_mad
+                ),
+                "minimum_cumulative_scale": (
+                    temporal_normalization_settings.minimum_cumulative_scale
+                ),
+                "maximum_cumulative_scale": (
+                    temporal_normalization_settings.maximum_cumulative_scale
+                ),
+                "attempted_frames": sum(
+                    item.temporal_depth_normalization_attempted
+                    for item in result.frame_statistics
+                ),
+                "accepted_frames": sum(
+                    item.temporal_depth_normalization_accepted
+                    for item in result.frame_statistics
+                ),
+                "reason_counts": {
+                    reason: sum(
+                        item.temporal_depth_normalization_reason == reason
+                        for item in result.frame_statistics
+                    )
+                    for reason in sorted({
+                        item.temporal_depth_normalization_reason
+                        for item in result.frame_statistics
+                        if item.temporal_depth_normalization_reason is not None
+                    })
+                },
+                "scientific_note": (
+                    "Pairwise relative-depth heuristic only; it does not recover "
+                    "metric scale, correct pose error, or prove accuracy."
+                ),
+            },
             "depth_quality_thresholds": {
                 "min_valid_depth_ratio": min_valid_depth_ratio,
                 "max_denominator_reject_ratio": max_denominator_reject_ratio,
@@ -901,6 +1202,7 @@ def main() -> int:
             "depth_inference_count": result.depth_inference_count,
             "runtime_metrics": {
                 "total_pipeline_runtime_seconds": total_pipeline_runtime,
+                "pose_chain_diagnostics_seconds": pose_chain_runtime_seconds,
                 **result.stage_timings,
             },
             "rejection_reason_counts": {
@@ -936,6 +1238,8 @@ def main() -> int:
             save_previews=save_previews,
             save_display_clean=save_display_clean,
             save_drift=save_drift,
+            pose_chain_rows=pose_chain_rows,
+            pose_chain_config=pose_chain_settings,
         )
 
         print("Relative multi-frame map completed")
@@ -956,6 +1260,12 @@ def main() -> int:
             print(
                 "Experimental stabilized map points: "
                 f"{result.stabilized_fused_cloud.output_point_count}"
+            )
+        if result.temporal_depth_normalization_enabled:
+            assert result.temporal_normalized_fused_cloud is not None
+            print(
+                "Experimental temporal-normalized map points: "
+                f"{result.temporal_normalized_fused_cloud.output_point_count}"
             )
         print(f"Relative trajectory poses: {result.trajectory_positions.shape[0]}")
         for item in result.frame_statistics:
@@ -995,6 +1305,27 @@ def main() -> int:
                     f"({item.stabilization_removed_ratio:.6f}), "
                     f"denominator p01/p05/median={item.denominator_p01}/"
                     f"{item.denominator_p05}/{item.denominator_median}"
+                )
+            if item.accepted and result.temporal_depth_normalization_enabled:
+                print(
+                    "  Temporal depth normalization: "
+                    f"accepted={item.temporal_depth_normalization_accepted}, "
+                    f"reason={item.temporal_depth_normalization_reason}, "
+                    f"correspondences={item.temporal_depth_correspondence_count}, "
+                    f"inliers={item.temporal_depth_inlier_count}, "
+                    f"inlier_ratio={item.temporal_depth_inlier_ratio:.6f}, "
+                    f"pairwise_scale={item.temporal_depth_scale_pairwise}, "
+                    f"cumulative_scale={item.temporal_depth_scale_cumulative}, "
+                    f"log_mad={item.temporal_depth_log_ratio_mad}, "
+                    f"original median/p95/p99={item.original_z_median}/"
+                    f"{item.original_z_p95}/{item.original_z_p99}, "
+                    f"normalized median/p95/p99={item.normalized_z_median}/"
+                    f"{item.normalized_z_p95}/{item.normalized_z_p99}, "
+                    f"residual median before/after="
+                    f"{item.temporal_residual_before_median}/"
+                    f"{item.temporal_residual_after_median}, "
+                    f"RMSE before/after={item.temporal_residual_before_rmse}/"
+                    f"{item.temporal_residual_after_rmse}"
                 )
             if item.refinement_3d_attempted:
                 print(
@@ -1070,6 +1401,16 @@ def main() -> int:
             print(
                 "Drift diagnostic directory: "
                 f"{(run_directory / 'drift_diagnostics').resolve()}"
+            )
+        if pose_chain_rows is not None:
+            pose_summary = metadata["pose_chain_diagnostics"]["results"]
+            print(
+                "Pose-chain diagnostics (heuristic only): "
+                f"{pose_summary['heuristic_warning_flags']}"
+            )
+            print(
+                "Pose-chain diagnostic directory: "
+                f"{(run_directory / 'pose_chain_diagnostics').resolve()}"
             )
         print(f"Outputs: {run_directory.resolve()}")
         return 0
