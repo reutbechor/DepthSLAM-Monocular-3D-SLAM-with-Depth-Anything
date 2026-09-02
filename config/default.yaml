@@ -87,6 +87,31 @@ pose_refinement_3d:
   maximum_translation_change_ratio: 2.0
   maximum_rotation_change_degrees: 10.0
 
+sliding_window_pose_optimization:
+  # Optional pose-only local optimization; the first pose stays fixed.
+  enabled: false
+  window_size: 3
+  minimum_observations: 300
+  minimum_relative_median_improvement: 0.05
+  maximum_rotation_change_deg: 2.0
+  # Relative to the original preceding camera-center step, not metres.
+  maximum_translation_change_relative: 0.50
+  robust_loss: huber
+  f_scale_px: 2.0
+  max_nfev: 100
+  finite_difference_step: 1.0e-6
+  projection_depth_epsilon: 1.0e-8
+
+sparse_landmarks:
+  # Optional additional map from tracked SIFT geometry; dense fusion is preserved.
+  enabled: false
+  minimum_track_length: 2
+  minimum_triangulation_angle_deg: 1.0
+  maximum_reprojection_error_px: 3.0
+  minimum_observations_after_validation: 2
+  # Reject only the extreme relative-distance tail after geometric validation.
+  maximum_landmark_distance_percentile: 99.5
+
 depth_stabilization:
   # Optional experiment applied only to point-cloud fusion after alignment.
   enabled: false

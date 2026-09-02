@@ -49,6 +49,11 @@ It is not loop closure, bundle adjustment, or ground-truth correction.
 evaluation, and optional trajectory refinement into one reproducible CLI and
 one verified final-run directory. It does not introduce a new SLAM algorithm.
 
+An optional sparse multi-view landmark experiment is also available. It keeps
+the dense map and accepted poses unchanged, tracks geometrically verified SIFT
+matches across accepted keyframes, and triangulates a separate relative,
+non-metric landmark map. It does not add bundle adjustment or loop closure.
+
 ## Quick Start / Final Pipeline
 
 After completing the setup below, run the full existing pipeline once:
@@ -949,6 +954,127 @@ This diagnostic remains relative and non-metric. Direct-versus-chained
 disagreement can support a pose-drift hypothesis, but the direct estimates are
 not ground truth and cannot prove global geometric accuracy.
 
+## Experimental local sliding-window pose optimization
+
+The mapper includes an optional pose-only optimization over a small window of
+accepted keyframes. It preserves the existing SIFT, Essential Matrix, PnP,
+depth alignment, keyframe, point-cloud, and fusion paths. Their accumulated
+`T_world_from_camera` poses are the initial guess; the first window pose is
+fixed, and only the later camera rotations and translations are optimized.
+
+The residual for an edge from camera `i` to camera `j` is the target image
+pixel minus the projection obtained by:
+
+```text
+p_world = T_world_from_camera_i p_camera_i
+p_camera_j = inverse(T_world_from_camera_j) p_world
+```
+
+Source 3D points use the existing aligned relative camera Z at accepted PnP
+inliers. Depth, intrinsics, scale, and landmarks are never optimization
+variables. A direct first-to-last edge is included only when the existing
+SIFT, Essential Matrix, and PnP gates accept it.
+
+SciPy is not installed in the validated environment and was not added as a
+dependency. This experiment uses a small deterministic NumPy
+Levenberg–Marquardt solver with finite-difference Jacobians and Huber or
+soft-L1 robust weights. The default Huber pixel scale is 2.0.
+
+The experiment is disabled by default. Enable it with:
+
+```powershell
+py tools\run_relative_map.py data\drone_new.mp4 `
+  --fx 800 --fy 800 --cx 636 --cy 321 `
+  --sample-every 15 --max-candidate-frames 3 `
+  --point-cloud-stride 4 --device cpu --keyframes `
+  --sliding-window-pose-optimization `
+  --no-pose-refinement-3d --no-depth-stabilization `
+  --no-temporal-depth-normalization
+```
+
+An optimized window is used only when the solver succeeds, enough observations
+exist, median reprojection error improves by the configured amount, and pose
+changes remain conservative relative to the original motion. Rejection leaves
+all baseline poses unchanged.
+
+When enabled, the output directory contains:
+
+- `sliding_window_optimization.json`
+- `global_relative_map_pose_baseline.ply`
+- `global_relative_map_pose_optimized.ply`
+- baseline/optimized front, oblique, and top previews
+- `trajectory_pose_baseline.png`
+- `trajectory_pose_optimized.png`
+
+The first isolated three-frame experiment used frames 0/15/30 and all three
+reliable edges. The solver reduced median reprojection error from 1.2779 px to
+1.2605 px (1.36%) and RMSE from 1.6294 px to 1.5913 px, while p90 increased
+from 2.4564 px to 2.4829 px. Because the median improvement was below the
+configured 5% gate, the candidate poses were rejected. The selected-pose map
+therefore remains byte-identical to the baseline, as intended; no visual map
+improvement was claimed and thresholds were not retuned.
+
+This remains local pose-only optimization over relative/non-metric geometry.
+Approximate intrinsics and fixed relative depths can bias its result. It does
+not recover metric scale or ground-truth motion, optimize landmarks, eliminate
+long-term drift, or provide loop closure. Lower reprojection error—and even
+better visual overlap—does not prove absolute geometric accuracy.
+
+## Optional sparse multi-view landmark map
+
+The sparse mapper provides an additional representation built from stable
+multi-view feature observations instead of assigning a Depth Anything value to
+many image pixels. Adjacent accepted keyframes reuse the existing SIFT ratio
+matches and Essential-Matrix inlier mask. Consistent keypoint identities are
+chained into tracks; conflicts are rejected deterministically so one keypoint
+cannot belong to multiple tracks.
+
+For each sufficiently long track, the observation pair with the largest camera
+baseline is triangulated. Because mapper poses are stored as
+`T_world_from_camera`, projection explicitly uses
+`inverse(T_world_from_camera)`. The resulting point must be finite, in front of
+every observing camera, above the configured triangulation-angle threshold,
+and below the reprojection-error threshold in every observation. A final
+relative-distance percentile rejects only the extreme landmark tail. Landmark
+color is the channel-wise median RGB value across in-bounds observations.
+
+Depth Anything is not used to create or overwrite the sparse landmark
+coordinates. The sparse coordinates inherit the mapper's relative scale and
+are not metres. A sparse map can be more visually coherent than dense
+monocular-depth fusion, but it is not automatically more accurate.
+
+The feature is disabled by default. A focused run is:
+
+```powershell
+py tools\run_relative_map.py data\dji_air3_short.mp4 `
+  --fx 1268 --fy 1268 --cx 960 --cy 540 `
+  --sample-every 15 --max-candidate-frames 5 `
+  --point-cloud-stride 4 --device cpu --keyframes --sparse-landmarks `
+  --no-pose-refinement-3d --no-depth-stabilization `
+  --no-temporal-depth-normalization --no-sliding-window-pose-optimization
+```
+
+The `sparse_landmarks` configuration section controls minimum track length,
+minimum triangulation angle, maximum per-observation reprojection error,
+minimum validated observations, and the optional far-distance percentile.
+Set `--sparse-min-track-length 3` for a stricter three-view experiment.
+
+In addition to every existing dense output, an enabled run writes:
+
+- `sparse_landmarks.ply`, `sparse_landmarks.npy`, and
+  `sparse_landmark_colors.npy`;
+- `sparse_landmark_tracks.json`, including all tracks, validation outcomes,
+  observations, errors, and triangulation details;
+- `sparse_map_front.png`, `sparse_map_oblique.png`, and `sparse_map_top.png`;
+- `sparse_map_with_trajectory_3d.png`;
+- `dense_vs_sparse_overview.png`.
+
+Diagnostics include total SIFT keypoints, reliable pair matches, track-length
+distribution, rejection counts, final landmark count, reprojection statistics,
+triangulation-angle statistics, and observation-count statistics. This stage
+does not optimize the poses or landmarks and does not implement global bundle
+adjustment, loop closure, ICP, or a pose graph.
+
 ## Stage 6: visual keyframe selection
 
 A keyframe is a candidate image selected to contribute a pose and dense cloud
@@ -1250,6 +1376,8 @@ DJI aerial footage.
 - PnP translation is in propagated relative-depth units, not metres.
 - Fixed-step translation remains available only as explicit debug behavior.
 - Sequential pose accumulation drifts over time.
+- Sparse landmarks inherit errors in the sequential relative poses and supplied
+  intrinsics; triangulation and reprojection gates do not establish accuracy.
 - Outlier filtering does not replace bundle adjustment or loop closure.
 - There is no loop closure, bundle adjustment, pose graph optimization, global
   relocalization, IMU/GNSS fusion, GUI, or ground-truth evaluation.

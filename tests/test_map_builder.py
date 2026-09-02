@@ -6,6 +6,9 @@ import numpy as np
 from src.depth_alignment import DepthAlignmentResult
 from src.depth_stabilization import DepthStabilizationConfig
 from src.temporal_depth_normalization import TemporalDepthNormalizationConfig
+from src.sliding_window_pose_optimization import (
+    SlidingWindowPoseOptimizationConfig,
+)
 from src.map_builder import MappingFrame, RelativeMapBuilder
 from src.keyframe_selector import KeyframeSelector, KeyframeThresholds
 from src.depth_types import CameraDepth, DepthPrediction
@@ -288,6 +291,110 @@ class MapBuilderTests(unittest.TestCase):
             experimental.fused_cloud.points, baseline.fused_cloud.points
         )
         self.assertIsNotNone(experimental.temporal_normalized_fused_cloud)
+
+    def test_transform_audit_is_diagnostic_only_and_captures_pair_trace(self) -> None:
+        def make_builder(capture: bool) -> RelativeMapBuilder:
+            return RelativeMapBuilder(
+                depth_estimator=FakeDepthEstimator(),
+                feature_tracker=FakeFeatureTracker(),
+                motion_estimator=SuccessfulGeometryEstimator(),
+                depth_pose_estimator=SuccessfulDepthPoseEstimator(),
+                depth_aligner=AlwaysAcceptAligner(),
+                camera_matrix=np.eye(3),
+                keyframe_selector=disabled_keyframes(),
+                point_cloud_stride=1,
+                voxel_size=0.1,
+                capture_transform_audit=capture,
+            )
+
+        baseline = make_builder(False).build([self.frame(0), self.frame(1)])
+        audited = make_builder(True).build([self.frame(0), self.frame(1)])
+
+        np.testing.assert_array_equal(
+            audited.trajectory_positions, baseline.trajectory_positions
+        )
+        np.testing.assert_array_equal(audited.fused_cloud.points, baseline.fused_cloud.points)
+        assert audited.transform_trace is not None
+        assert audited.transform_pair_consistency is not None
+        self.assertEqual(len(audited.transform_trace), 2)
+        self.assertEqual(len(audited.transform_pair_consistency), 1)
+        self.assertEqual(
+            audited.transform_pair_consistency[0].correspondence_count, 8
+        )
+
+    def test_disabled_sliding_window_reproduces_previous_mapping_behavior(self) -> None:
+        def make_builder(config=None) -> RelativeMapBuilder:
+            return RelativeMapBuilder(
+                depth_estimator=FakeDepthEstimator(),
+                feature_tracker=FakeFeatureTracker(),
+                motion_estimator=SuccessfulGeometryEstimator(),
+                depth_pose_estimator=SuccessfulDepthPoseEstimator(),
+                depth_aligner=AlwaysAcceptAligner(),
+                camera_matrix=np.eye(3),
+                keyframe_selector=disabled_keyframes(),
+                point_cloud_stride=1,
+                voxel_size=0.1,
+                sliding_window_pose_optimization=config,
+            )
+
+        baseline = make_builder().build([
+            self.frame(0), self.frame(1), self.frame(2)
+        ])
+        explicitly_disabled = make_builder(
+            SlidingWindowPoseOptimizationConfig(enabled=False)
+        ).build([self.frame(0), self.frame(1), self.frame(2)])
+
+        np.testing.assert_array_equal(
+            explicitly_disabled.trajectory_positions,
+            baseline.trajectory_positions,
+        )
+        np.testing.assert_array_equal(
+            explicitly_disabled.fused_cloud.points, baseline.fused_cloud.points
+        )
+        self.assertIsNone(
+            explicitly_disabled.sliding_window_pose_optimization_result
+        )
+
+    def test_enabled_sliding_window_reuses_keyframes_depths_and_cloud_inputs(self) -> None:
+        depth = FakeDepthEstimator()
+        builder = RelativeMapBuilder(
+            depth_estimator=depth,
+            feature_tracker=FakeFeatureTracker(),
+            motion_estimator=SuccessfulGeometryEstimator(),
+            depth_pose_estimator=SuccessfulDepthPoseEstimator(),
+            depth_aligner=AlwaysAcceptAligner(),
+            camera_matrix=np.eye(3),
+            keyframe_selector=disabled_keyframes(),
+            point_cloud_stride=1,
+            voxel_size=0.1,
+            sliding_window_pose_optimization=(
+                SlidingWindowPoseOptimizationConfig(
+                    enabled=True,
+                    minimum_observations=1,
+                    minimum_relative_median_improvement=0.0,
+                    maximum_rotation_change_deg=10.0,
+                    maximum_translation_change_relative=10.0,
+                    max_nfev=100,
+                )
+            ),
+        )
+
+        result = builder.build([self.frame(0), self.frame(1), self.frame(2)])
+
+        self.assertTrue(result.sliding_window_pose_optimization_enabled)
+        self.assertIsNotNone(result.sliding_window_pose_optimization_result)
+        self.assertIsNotNone(result.pose_optimized_fused_cloud)
+        np.testing.assert_array_equal(result.trajectory_frame_indices, [0, 1, 2])
+        self.assertEqual(depth.calls, 3)
+        self.assertEqual(
+            result.pose_optimized_raw_fused_point_count,
+            result.raw_fused_point_count,
+        )
+        assert result.sliding_window_pose_optimization_result is not None
+        self.assertEqual(
+            result.sliding_window_pose_optimization_result.window_frame_indices,
+            (0, 1, 2),
+        )
 
     def test_rejected_motion_adds_neither_pose_nor_cloud(self) -> None:
         depth = FakeDepthEstimator()

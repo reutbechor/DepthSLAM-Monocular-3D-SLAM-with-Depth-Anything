@@ -58,6 +58,13 @@ class MotionEstimatorTests(unittest.TestCase):
         self.assertEqual(result.rotation.dtype, np.float64)
         self.assertEqual(result.translation_direction.dtype, np.float64)
         self.assertAlmostEqual(float(np.linalg.norm(result.translation_direction)), 1.0)
+        # points1 is previous and points2 is current, so recoverPose must return
+        # T_current_from_previous rather than its inverse.
+        np.testing.assert_allclose(result.rotation, rotation, atol=1e-5)
+        expected_direction = translation / np.linalg.norm(translation)
+        np.testing.assert_allclose(
+            result.translation_direction.reshape(3), expected_direction, atol=1e-5
+        )
 
 
 if __name__ == "__main__":

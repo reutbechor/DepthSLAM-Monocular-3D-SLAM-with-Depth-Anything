@@ -38,11 +38,32 @@ from .pose_refinement_3d import (
     build_pair_alignment_clouds,
 )
 from .robust_filtering import GlobalOutlierFilterResult, filter_global_radius
+from .sliding_window_pose_optimization import (
+    PoseWindowFrame,
+    ReprojectionEdge,
+    SlidingWindowPoseOptimizationConfig,
+    SlidingWindowPoseOptimizationResult,
+    SlidingWindowPoseOptimizer,
+    build_reprojection_edge,
+)
+from .sparse_landmark_map import (
+    PairwiseLandmarkMatches,
+    SparseKeyframe,
+    SparseLandmarkConfig,
+    SparseLandmarkMapper,
+    SparseLandmarkResult,
+)
 from .temporal_depth_normalization import (
     TemporalDepthNormalizationConfig,
     matched_world_residual_statistics,
     normalize_temporal_depth,
     reference_temporal_depth_result,
+)
+from .transform_audit import (
+    TransformTraceEntry,
+    TwoFrameTransformConsistency,
+    evaluate_two_frame_transform_consistency,
+    make_transform_trace_entry,
 )
 from .transforms import transform_points
 
@@ -52,6 +73,14 @@ class MappingFrame:
     image: np.ndarray
     frame_index: int
     timestamp_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class _OptimizationKeyframe:
+    frame: MappingFrame
+    camera_depth: CameraDepth
+    camera_cloud: PointCloudResult
+    world_from_camera: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -259,6 +288,19 @@ class RelativeMapResult:
     temporal_normalized_voxel_downsampled_point_count: int | None
     temporal_normalized_fused_cloud: FusedPointCloud | None
     temporal_normalized_global_filter: GlobalOutlierFilterResult | None
+    transform_trace: tuple[TransformTraceEntry, ...] | None = None
+    transform_pair_consistency: tuple[TwoFrameTransformConsistency, ...] | None = None
+    sliding_window_pose_optimization_enabled: bool = False
+    sliding_window_pose_optimization_result: (
+        SlidingWindowPoseOptimizationResult | None
+    ) = None
+    pose_optimized_raw_fused_point_count: int | None = None
+    pose_optimized_voxel_downsampled_point_count: int | None = None
+    pose_optimized_fused_cloud: FusedPointCloud | None = None
+    pose_optimized_global_filter: GlobalOutlierFilterResult | None = None
+    pose_optimized_trajectory_positions: np.ndarray | None = None
+    sparse_landmarks_enabled: bool = False
+    sparse_landmark_result: SparseLandmarkResult | None = None
 
 
 class RelativeMapBuilder:
@@ -291,6 +333,11 @@ class RelativeMapBuilder:
         depth_stabilization: DepthStabilizationConfig | None = None,
         capture_pose_chain_diagnostics: bool = False,
         temporal_depth_normalization: TemporalDepthNormalizationConfig | None = None,
+        capture_transform_audit: bool = False,
+        sliding_window_pose_optimization: (
+            SlidingWindowPoseOptimizationConfig | None
+        ) = None,
+        sparse_landmarks: SparseLandmarkConfig | None = None,
     ) -> None:
         if scale_mode not in {"depth-pnp", "fixed-step"}:
             raise ValueError("scale_mode must be 'depth-pnp' or 'fixed-step'")
@@ -337,6 +384,25 @@ class RelativeMapBuilder:
         self.capture_pose_chain_diagnostics = bool(capture_pose_chain_diagnostics)
         self.temporal_depth_normalization = (
             temporal_depth_normalization or TemporalDepthNormalizationConfig()
+        )
+        self.capture_transform_audit = bool(capture_transform_audit)
+        self.sliding_window_pose_optimization = (
+            sliding_window_pose_optimization
+            or SlidingWindowPoseOptimizationConfig()
+        )
+        if (
+            self.sliding_window_pose_optimization.enabled
+            and self.scale_mode != "depth-pnp"
+        ):
+            raise ValueError(
+                "sliding-window pose optimization requires scale_mode='depth-pnp'"
+            )
+        self.sliding_window_pose_optimizer = SlidingWindowPoseOptimizer(
+            self.sliding_window_pose_optimization
+        )
+        self.sparse_landmarks = sparse_landmarks or SparseLandmarkConfig()
+        self.sparse_landmark_mapper = SparseLandmarkMapper(
+            self.camera_matrix, self.sparse_landmarks
         )
         self._stage_timings: dict[str, float] = {}
 
@@ -484,6 +550,8 @@ class RelativeMapBuilder:
             "depth_inference_seconds": 0.0,
             "pnp_depth_alignment_seconds": 0.0,
             "pose_refinement_3d_seconds": 0.0,
+            "sliding_window_pose_optimization_seconds": 0.0,
+            "sparse_landmark_mapping_seconds": 0.0,
             "point_cloud_fusion_seconds": 0.0,
         }
         iterator = iter(frames)
@@ -511,6 +579,24 @@ class RelativeMapBuilder:
         pair_alignment: PairAlignmentRecord | None = None
         pose_chain_frames: list[PoseChainFrameInput] | None = (
             [] if self.capture_pose_chain_diagnostics else None
+        )
+        transform_trace: list[TransformTraceEntry] | None = (
+            [] if self.capture_transform_audit else None
+        )
+        transform_pair_consistency: list[TwoFrameTransformConsistency] | None = (
+            [] if self.capture_transform_audit else None
+        )
+        optimization_keyframes: list[_OptimizationKeyframe] | None = (
+            [] if self.sliding_window_pose_optimization.enabled else None
+        )
+        optimization_edges: list[ReprojectionEdge] | None = (
+            [] if self.sliding_window_pose_optimization.enabled else None
+        )
+        sparse_keyframes: list[SparseKeyframe] | None = (
+            [] if self.sparse_landmarks.enabled else None
+        )
+        sparse_pairs: list[PairwiseLandmarkMatches] | None = (
+            [] if self.sparse_landmarks.enabled else None
         )
 
         try:
@@ -550,6 +636,13 @@ class RelativeMapBuilder:
             )
         except (RuntimeError, TypeError, ValueError) as exc:
             raise RuntimeError(f"first frame could not initialize the map: {exc}") from exc
+        sliding_result: SlidingWindowPoseOptimizationResult | None = None
+        pose_optimized_fusion: RelativeMapFusion | None = None
+        pose_optimized_voxelized: FusedPointCloud | None = None
+        pose_optimized_global_filter: GlobalOutlierFilterResult | None = None
+        pose_optimized_fused: FusedPointCloud | None = None
+        pose_optimized_trajectory: np.ndarray | None = None
+
         fusion_started = perf_counter()
         fusion.add(first_cloud.points, first_cloud.colors)
         if stabilized_fusion is not None:
@@ -598,6 +691,28 @@ class RelativeMapBuilder:
                 frame_index=first.frame_index,
                 image_bgr=first.image.copy(),
                 camera_depth=replace(first_depth, values=first_depth.values.copy()),
+                world_from_camera=np.eye(4, dtype=np.float64),
+            ))
+        if transform_trace is not None:
+            transform_trace.append(make_transform_trace_entry(
+                first.frame_index,
+                np.eye(3, dtype=np.float64),
+                np.zeros(3, dtype=np.float64),
+                np.eye(4, dtype=np.float64),
+            ))
+        if optimization_keyframes is not None:
+            optimization_keyframes.append(_OptimizationKeyframe(
+                frame=first,
+                camera_depth=replace(
+                    first_depth, values=first_depth.values.copy()
+                ),
+                camera_cloud=first_cloud,
+                world_from_camera=np.eye(4, dtype=np.float64),
+            ))
+        if sparse_keyframes is not None:
+            sparse_keyframes.append(SparseKeyframe(
+                frame_index=first.frame_index,
+                image_bgr=first.image.copy(),
                 world_from_camera=np.eye(4, dtype=np.float64),
             ))
         frames_since_last_keyframe = 0
@@ -987,6 +1102,104 @@ class RelativeMapBuilder:
                     direction / np.linalg.norm(direction) * self.translation_step
                 )
 
+            if transform_trace is not None:
+                transform_trace.append(make_transform_trace_entry(
+                    frame.frame_index,
+                    rotation,
+                    selected_relative_translation,
+                    world_pose,
+                ))
+                if scale_method == "depth_pnp":
+                    assert transform_pair_consistency is not None
+                    try:
+                        audit_correspondences = build_3d_correspondences(
+                            matches.points1,
+                            matches.points2,
+                            scaled_pose.inlier_mask,
+                            previous_depth,
+                            camera_depth,
+                            self.camera_matrix,
+                        )
+                        transform_pair_consistency.append(
+                            evaluate_two_frame_transform_consistency(
+                                audit_correspondences.previous_points,
+                                audit_correspondences.current_points,
+                                rotation,
+                                selected_relative_translation,
+                                previous_world_pose,
+                                world_pose,
+                                previous_frame_index=previous_accepted.frame_index,
+                                current_frame_index=frame.frame_index,
+                                coordinate_units=(
+                                    audit_correspondences.coordinate_units
+                                ),
+                                is_metric=audit_correspondences.is_metric,
+                            )
+                        )
+                    except (RuntimeError, TypeError, ValueError) as exc:
+                        transform_pair_consistency.append(
+                            TwoFrameTransformConsistency(
+                                previous_frame_index=(
+                                    previous_accepted.frame_index
+                                ),
+                                current_frame_index=frame.frame_index,
+                                correspondence_count=0,
+                                local_median_discrepancy=None,
+                                local_rmse_discrepancy=None,
+                                world_median_discrepancy=None,
+                                world_rmse_discrepancy=None,
+                                maximum_local_world_residual_difference=None,
+                                coordinate_units=previous_depth.coordinate_units,
+                                is_metric=previous_depth.is_metric,
+                                error=str(exc),
+                            )
+                        )
+
+            if optimization_edges is not None and scale_method == "depth_pnp":
+                try:
+                    optimization_edges.append(build_reprojection_edge(
+                        previous_accepted.frame_index,
+                        frame.frame_index,
+                        matches.points1,
+                        matches.points2,
+                        scaled_pose.inlier_mask,
+                        previous_depth,
+                        self.camera_matrix,
+                        geometric_support="pnp_inliers",
+                    ))
+                except (RuntimeError, TypeError, ValueError):
+                    # Optimization capture is optional and must not reject a
+                    # frame already accepted by the baseline mapper.
+                    pass
+
+            if sparse_pairs is not None:
+                try:
+                    inlier_mask = np.asarray(
+                        geometry_pose.inlier_mask, dtype=bool
+                    ).reshape(-1)
+                    good = list(matches.good_matches)
+                    if inlier_mask.shape[0] != len(good):
+                        raise ValueError("geometric inlier mask does not match SIFT matches")
+                    sparse_pairs.append(PairwiseLandmarkMatches(
+                        previous_frame_index=previous_accepted.frame_index,
+                        current_frame_index=frame.frame_index,
+                        previous_keypoint_indices=np.asarray(
+                            [item.queryIdx for item, keep in zip(good, inlier_mask) if keep],
+                            dtype=np.int64,
+                        ),
+                        current_keypoint_indices=np.asarray(
+                            [item.trainIdx for item, keep in zip(good, inlier_mask) if keep],
+                            dtype=np.int64,
+                        ),
+                        previous_pixels=np.asarray(matches.points1)[inlier_mask].copy(),
+                        current_pixels=np.asarray(matches.points2)[inlier_mask].copy(),
+                        previous_keypoint_count=len(matches.keypoints1),
+                        current_keypoint_count=len(matches.keypoints2),
+                    ))
+                except (AttributeError, TypeError, ValueError):
+                    # Sparse capture is optional and cannot invalidate a dense keyframe.
+                    pass
+
             if (
                 scale_method == "depth_pnp"
                 and self.pose_refiner_3d.config.enabled
@@ -1114,6 +1327,21 @@ class RelativeMapBuilder:
             self._add_timing(
                 "point_cloud_fusion_seconds", perf_counter() - fusion_started
             )
+            if optimization_keyframes is not None:
+                optimization_keyframes.append(_OptimizationKeyframe(
+                    frame=frame,
+                    camera_depth=replace(
+                        camera_depth, values=camera_depth.values.copy()
+                    ),
+                    camera_cloud=camera_cloud,
+                    world_from_camera=world_pose.copy(),
+                ))
+            if sparse_keyframes is not None:
+                sparse_keyframes.append(SparseKeyframe(
+                    frame_index=frame.frame_index,
+                    image_bgr=frame.image.copy(),
+                    world_from_camera=world_pose.copy(),
+                ))
             position = tuple(float(value) for value in world_pose[:3, 3])
             relative_translation_tuple = tuple(
                 float(value) for value in selected_relative_translation
@@ -1161,6 +1389,113 @@ class RelativeMapBuilder:
                     world_from_camera=world_pose.copy(),
                 ))
             frames_since_last_keyframe = 0
+
+        if optimization_keyframes is not None:
+            optimization_started = perf_counter()
+            window_size = self.sliding_window_pose_optimization.window_size
+            window_records = optimization_keyframes[-window_size:]
+            window_indices = {item.frame.frame_index for item in window_records}
+            window_edges = [
+                edge for edge in (optimization_edges or [])
+                if edge.source_frame_index in window_indices
+                and edge.target_frame_index in window_indices
+            ]
+            if len(window_records) >= 3:
+                source_record = window_records[0]
+                target_record = window_records[-1]
+                direct_pair = (
+                    source_record.frame.frame_index,
+                    target_record.frame.frame_index,
+                )
+                if not any(
+                    (edge.source_frame_index, edge.target_frame_index)
+                    == direct_pair
+                    for edge in window_edges
+                ):
+                    try:
+                        direct_matches = self.feature_tracker.match(
+                            source_record.frame.image,
+                            target_record.frame.image,
+                        )
+                        direct_geometry = self.motion_estimator.estimate(
+                            direct_matches.points1,
+                            direct_matches.points2,
+                            self.camera_matrix,
+                        )
+                        if direct_geometry.success:
+                            direct_pose = self.depth_pose_estimator.estimate(
+                                direct_matches.points1,
+                                direct_matches.points2,
+                                direct_geometry.inlier_mask,
+                                source_record.camera_depth,
+                                self.camera_matrix,
+                            )
+                            if direct_pose.success:
+                                window_edges.append(build_reprojection_edge(
+                                    direct_pair[0],
+                                    direct_pair[1],
+                                    direct_matches.points1,
+                                    direct_matches.points2,
+                                    direct_pose.inlier_mask,
+                                    source_record.camera_depth,
+                                    self.camera_matrix,
+                                    geometric_support="direct_pnp_inliers",
+                                ))
+                    except (RuntimeError, TypeError, ValueError):
+                        # A weak direct edge is optional; adjacent reliable
+                        # PnP edges remain sufficient to attempt the window.
+                        pass
+            height, width = first.image.shape[:2]
+            sliding_result = self.sliding_window_pose_optimizer.optimize(
+                [PoseWindowFrame(
+                    item.frame.frame_index,
+                    item.world_from_camera,
+                ) for item in window_records],
+                window_edges,
+                self.camera_matrix,
+                (width, height),
+            )
+            selected_window_poses = {
+                frame_index: pose
+                for frame_index, pose in zip(
+                    sliding_result.window_frame_indices,
+                    sliding_result.selected_world_from_camera,
+                )
+            }
+            pose_optimized_fusion = RelativeMapFusion(self.voxel_size)
+            optimized_positions: list[np.ndarray] = []
+            for item in optimization_keyframes:
+                pose = selected_window_poses.get(
+                    item.frame.frame_index, item.world_from_camera
+                )
+                optimized_positions.append(pose[:3, 3].copy())
+                optimized_world_points = transform_points(
+                    item.camera_cloud.points, pose[:3, :3], pose[:3, 3]
+                )
+                pose_optimized_fusion.add(
+                    optimized_world_points, item.camera_cloud.colors
+                )
+            pose_optimized_trajectory = np.asarray(
+                optimized_positions, dtype=np.float64
+            )
+            pose_optimized_voxelized = pose_optimized_fusion.finalize()
+            pose_optimized_global_filter = filter_global_radius(
+                pose_optimized_voxelized.points,
+                pose_optimized_voxelized.colors,
+                self.global_outlier_percentile,
+            )
+            pose_optimized_fused = FusedPointCloud(
+                points=pose_optimized_global_filter.points,
+                colors=pose_optimized_global_filter.colors,
+                input_point_count=pose_optimized_fusion.raw_point_count,
+                output_point_count=pose_optimized_global_filter.output_count,
+                voxel_size=self.voxel_size,
+                coordinate_units=first_depth.coordinate_units,
+            )
+            self._add_timing(
+                "sliding_window_pose_optimization_seconds",
+                perf_counter() - optimization_started,
+            )
 
         fusion_started = perf_counter()
         voxelized = fusion.finalize()
@@ -1220,6 +1555,16 @@ class RelativeMapBuilder:
                 voxel_size=self.voxel_size,
                 coordinate_units=fused.coordinate_units,
             )
+        sparse_result: SparseLandmarkResult | None = None
+        if sparse_keyframes is not None:
+            sparse_started = perf_counter()
+            sparse_result = self.sparse_landmark_mapper.build(
+                sparse_keyframes, sparse_pairs or ()
+            )
+            self._add_timing(
+                "sparse_landmark_mapping_seconds", perf_counter() - sparse_started
+            )
+
         accepted_count = sum(item.accepted for item in statistics)
         skipped_count = sum(
             item.status == "skipped_non_keyframe" for item in statistics
@@ -1292,4 +1637,31 @@ class RelativeMapBuilder:
             ),
             temporal_normalized_fused_cloud=temporal_fused,
             temporal_normalized_global_filter=temporal_global_filter,
+            transform_trace=(
+                None if transform_trace is None else tuple(transform_trace)
+            ),
+            transform_pair_consistency=(
+                None
+                if transform_pair_consistency is None
+                else tuple(transform_pair_consistency)
+            ),
+            sliding_window_pose_optimization_enabled=(
+                self.sliding_window_pose_optimization.enabled
+            ),
+            sliding_window_pose_optimization_result=sliding_result,
+            pose_optimized_raw_fused_point_count=(
+                None
+                if pose_optimized_fusion is None
+                else pose_optimized_fusion.raw_point_count
+            ),
+            pose_optimized_voxel_downsampled_point_count=(
+                None
+                if pose_optimized_voxelized is None
+                else pose_optimized_voxelized.output_point_count
+            ),
+            pose_optimized_fused_cloud=pose_optimized_fused,
+            pose_optimized_global_filter=pose_optimized_global_filter,
+            pose_optimized_trajectory_positions=pose_optimized_trajectory,
+            sparse_landmarks_enabled=self.sparse_landmarks.enabled,
+            sparse_landmark_result=sparse_result,
         )

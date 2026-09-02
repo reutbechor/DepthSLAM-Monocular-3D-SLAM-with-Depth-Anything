@@ -44,7 +44,15 @@ from src.pose_refinement_3d import (
     RobustPoseRefiner3D,
 )
 from src.robust_filtering import coordinate_statistics
+from src.sliding_window_pose_optimization import (
+    SlidingWindowPoseOptimizationConfig,
+)
+from src.sparse_landmark_map import (
+    SparseLandmarkConfig,
+    save_sparse_landmark_outputs,
+)
 from src.temporal_depth_normalization import TemporalDepthNormalizationConfig
+from src.transform_audit import save_transform_trace
 from src.video_loader import VideoLoader
 from src.visual_outputs import (
     CloudVisualArtifacts,
@@ -53,6 +61,8 @@ from src.visual_outputs import (
     save_depth_stabilization_comparison,
     save_temporal_depth_normalization_comparison,
     save_map_overview_panel,
+    save_pose_optimization_comparison,
+    save_pose_trajectory_comparison,
     save_point_cloud_preview,
     save_trajectory_previews,
 )
@@ -154,6 +164,21 @@ def parse_args() -> argparse.Namespace:
         help="Enable experimental pairwise aligned-depth scale normalization",
     )
     parser.add_argument(
+        "--sliding-window-pose-optimization",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable optional local pose-only window optimization",
+    )
+    parser.add_argument(
+        "--sparse-landmarks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable optional sparse multi-view feature landmark mapping",
+    )
+    parser.add_argument("--sparse-min-track-length", type=int)
+    parser.add_argument("--sparse-min-triangulation-angle-deg", type=float)
+    parser.add_argument("--sparse-max-reprojection-error-px", type=float)
+    parser.add_argument(
         "--save-previews",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -176,6 +201,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Estimate diagnostic-only direct reference-to-keyframe poses",
+    )
+    parser.add_argument(
+        "--transform-audit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save diagnostic-only local/cumulative transform trace and pair checks",
     )
     parser.add_argument("--ratio-threshold", type=float)
     parser.add_argument("--max-features", type=int)
@@ -524,12 +555,102 @@ def save_outputs(
         })
     else:
         metadata["temporal_depth_normalization"]["comparison_artifacts"] = None
+    if result.sliding_window_pose_optimization_enabled:
+        optimization = result.sliding_window_pose_optimization_result
+        optimized_cloud = result.pose_optimized_fused_cloud
+        optimized_trajectory = result.pose_optimized_trajectory_positions
+        if optimization is None or optimized_cloud is None or optimized_trajectory is None:
+            raise RuntimeError(
+                "enabled sliding-window optimization produced incomplete outputs"
+            )
+        pose_artifacts = save_pose_optimization_comparison(
+            directory,
+            result.fused_cloud.points,
+            result.fused_cloud.colors,
+            optimized_cloud.points,
+            optimized_cloud.colors,
+            preview_max_points=int(visual_config.get("preview_max_points", 40_000)),
+        )
+        trajectory_artifacts = save_pose_trajectory_comparison(
+            directory,
+            result.trajectory_positions,
+            optimized_trajectory,
+        )
+        report_path = directory / "sliding_window_optimization.json"
+        with report_path.open("w", encoding="utf-8") as file:
+            json.dump(optimization.report_dict(), file, indent=2)
+        metadata["sliding_window_pose_optimization"].update({
+            "report": report_path.name,
+            "comparison_artifacts": {
+                **{name: path.name for name, path in pose_artifacts.items()},
+                **{name: path.name for name, path in trajectory_artifacts.items()},
+            },
+            "same_keyframes": True,
+            "same_depth_arrays": True,
+            "same_camera_point_clouds": True,
+            "same_fusion_voxel_and_filter_settings": True,
+            "baseline_map": {
+                "fused_input_point_count": result.raw_fused_point_count,
+                "final_point_count": result.fused_cloud.output_point_count,
+                **temporal_map_statistics(result.fused_cloud.points),
+            },
+            "selected_pose_map": {
+                "fused_input_point_count": (
+                    result.pose_optimized_raw_fused_point_count
+                ),
+                "final_point_count": optimized_cloud.output_point_count,
+                **temporal_map_statistics(optimized_cloud.points),
+            },
+        })
+    else:
+        metadata["sliding_window_pose_optimization"]["comparison_artifacts"] = None
     save_optional_drift_diagnostics(
         directory, result, metadata, enabled=save_drift
     )
     save_optional_pose_chain_diagnostics(
         directory, metadata, pose_chain_rows, pose_chain_config
     )
+    if result.transform_trace is None:
+        metadata["transform_convention_audit"] = {
+            "enabled": False,
+            "diagnostic_only": True,
+        }
+    else:
+        pair_consistency = result.transform_pair_consistency or ()
+        trace_path = save_transform_trace(
+            directory / "transform_trace.json",
+            result.transform_trace,
+            pair_consistency,
+        )
+        metadata["transform_convention_audit"] = {
+            "enabled": True,
+            "diagnostic_only": True,
+            "artifact": trace_path.name,
+            "canonical_notation": "T_A_from_B maps p_B to p_A",
+            "pose_composition": (
+                "T_world_from_current = T_world_from_previous @ "
+                "inverse(T_current_from_previous)"
+            ),
+            "trace_entry_count": len(result.transform_trace),
+            "pair_consistency_count": len(pair_consistency),
+        }
+    if result.sparse_landmarks_enabled:
+        if result.sparse_landmark_result is None:
+            raise RuntimeError("enabled sparse landmark mapping produced no result")
+        sparse_paths = save_sparse_landmark_outputs(
+            directory,
+            result.sparse_landmark_result,
+            result.trajectory_positions,
+            result.preview_image_bgr,
+            artifacts.cleaning.points,
+            artifacts.cleaning.colors,
+        )
+        metadata["sparse_landmarks"].update({
+            "result": result.sparse_landmark_result.metadata_dict(),
+            "artifacts": {name: path.name for name, path in sparse_paths.items()},
+        })
+    else:
+        metadata["sparse_landmarks"]["artifacts"] = None
     with (directory / "metadata.json").open("w", encoding="utf-8") as file:
         json.dump(metadata, file, indent=2)
     return artifacts.raw_paths[0], artifacts
@@ -613,6 +734,10 @@ def main() -> int:
         temporal_normalization_config = config.get(
             "temporal_depth_normalization", {}
         )
+        sliding_window_config = config.get(
+            "sliding_window_pose_optimization", {}
+        )
+        sparse_landmark_config = config.get("sparse_landmarks", {})
         visual_config = config.get("visual_output", {})
         diagnostics_config = config.get("diagnostics", {})
         output_config = config.get("output", {})
@@ -625,6 +750,8 @@ def main() -> int:
             depth_stabilization_config,
             pose_chain_config,
             temporal_normalization_config,
+            sliding_window_config,
+            sparse_landmark_config,
             visual_config,
             diagnostics_config,
             output_config,
@@ -632,7 +759,9 @@ def main() -> int:
             raise ValueError(
                 "model, motion, keyframes, map, pose_refinement_3d, "
                 "depth_stabilization, temporal_depth_normalization, "
-                "pose_chain_diagnostics, visual_output, diagnostics, and "
+                "sliding_window_pose_optimization, pose_chain_diagnostics, "
+                "sparse_landmarks, "
+                "visual_output, diagnostics, and "
                 "output config sections must be mappings"
             )
         camera_matrix = camera_matrix_from_args(args, config)
@@ -845,6 +974,82 @@ def main() -> int:
                 "log_mad_outlier_multiplier", 3.5
             )),
         )
+        sliding_window_settings = SlidingWindowPoseOptimizationConfig(
+            enabled=bool(setting(
+                args.sliding_window_pose_optimization,
+                sliding_window_config,
+                "enabled",
+                False,
+            )),
+            window_size=int(sliding_window_config.get("window_size", 3)),
+            minimum_observations=int(sliding_window_config.get(
+                "minimum_observations", 300
+            )),
+            minimum_relative_median_improvement=float(
+                sliding_window_config.get(
+                    "minimum_relative_median_improvement", 0.05
+                )
+            ),
+            maximum_rotation_change_deg=float(sliding_window_config.get(
+                "maximum_rotation_change_deg", 2.0
+            )),
+            maximum_translation_change_relative=float(
+                sliding_window_config.get(
+                    "maximum_translation_change_relative", 0.50
+                )
+            ),
+            robust_loss=str(sliding_window_config.get(
+                "robust_loss", "huber"
+            )),
+            f_scale_px=float(sliding_window_config.get("f_scale_px", 2.0)),
+            max_nfev=int(sliding_window_config.get("max_nfev", 100)),
+            finite_difference_step=float(sliding_window_config.get(
+                "finite_difference_step", 1e-6
+            )),
+            projection_depth_epsilon=float(sliding_window_config.get(
+                "projection_depth_epsilon", 1e-8
+            )),
+        )
+        sparse_landmark_settings = SparseLandmarkConfig(
+            enabled=bool(setting(
+                args.sparse_landmarks,
+                sparse_landmark_config,
+                "enabled",
+                False,
+            )),
+            minimum_track_length=int(setting(
+                args.sparse_min_track_length,
+                sparse_landmark_config,
+                "minimum_track_length",
+                2,
+            )),
+            minimum_triangulation_angle_deg=float(setting(
+                args.sparse_min_triangulation_angle_deg,
+                sparse_landmark_config,
+                "minimum_triangulation_angle_deg",
+                1.0,
+            )),
+            maximum_reprojection_error_px=float(setting(
+                args.sparse_max_reprojection_error_px,
+                sparse_landmark_config,
+                "maximum_reprojection_error_px",
+                3.0,
+            )),
+            minimum_observations_after_validation=int(
+                sparse_landmark_config.get(
+                    "minimum_observations_after_validation", 2
+                )
+            ),
+            maximum_landmark_distance_percentile=(
+                None
+                if sparse_landmark_config.get(
+                    "maximum_landmark_distance_percentile", 99.5
+                ) is None
+                else float(sparse_landmark_config.get(
+                    "maximum_landmark_distance_percentile", 99.5
+                ))
+            ),
+        )
         keyframe_thresholds = KeyframeThresholds(
             enabled=keyframes_enabled,
             min_good_matches=keyframe_config.get("min_good_matches", 100),
@@ -928,6 +1133,9 @@ def main() -> int:
             depth_stabilization=depth_stabilization_settings,
             capture_pose_chain_diagnostics=pose_chain_settings.enabled,
             temporal_depth_normalization=temporal_normalization_settings,
+            capture_transform_audit=bool(args.transform_audit),
+            sliding_window_pose_optimization=sliding_window_settings,
+            sparse_landmarks=sparse_landmark_settings,
         )
         result = builder.build(selected_frames)
         pose_chain_rows: list[PoseChainDiagnosticRow] | None = None
@@ -1182,6 +1390,75 @@ def main() -> int:
                     "metric scale, correct pose error, or prove accuracy."
                 ),
             },
+            "sliding_window_pose_optimization": {
+                "enabled": sliding_window_settings.enabled,
+                "experimental": True,
+                "method": "pose_only_local_window_numpy_lm",
+                "solver_dependency": "NumPy/OpenCV only; SciPy not required",
+                "pose_convention": "T_world_from_camera",
+                "coordinate_scale": "relative_non_metric",
+                "first_pose_fixed": True,
+                "depth_fixed": True,
+                "intrinsics_fixed": True,
+                "scale_fixed": True,
+                "window_size": sliding_window_settings.window_size,
+                "minimum_observations": (
+                    sliding_window_settings.minimum_observations
+                ),
+                "minimum_relative_median_improvement": (
+                    sliding_window_settings.minimum_relative_median_improvement
+                ),
+                "maximum_rotation_change_deg": (
+                    sliding_window_settings.maximum_rotation_change_deg
+                ),
+                "maximum_translation_change_relative": (
+                    sliding_window_settings.maximum_translation_change_relative
+                ),
+                "robust_loss": sliding_window_settings.robust_loss,
+                "f_scale_px": sliding_window_settings.f_scale_px,
+                "max_nfev": sliding_window_settings.max_nfev,
+                "result": (
+                    None
+                    if result.sliding_window_pose_optimization_result is None
+                    else result.sliding_window_pose_optimization_result.report_dict()
+                ),
+                "scientific_note": (
+                    "Local pose-only reprojection optimization in relative units; "
+                    "it does not optimize depth or landmarks, recover metric scale, "
+                    "provide loop closure, or prove absolute trajectory accuracy."
+                ),
+            },
+            "sparse_landmarks": {
+                "enabled": sparse_landmark_settings.enabled,
+                "method": "tracked_geometric_sift_multiview_triangulation",
+                "pose_convention": "T_world_from_camera",
+                "coordinate_scale": "relative_non_metric",
+                "is_metric": False,
+                "depth_used_for_landmark_geometry": False,
+                "color_method": "median_rgb_across_track_observations",
+                "configuration": {
+                    "minimum_track_length": (
+                        sparse_landmark_settings.minimum_track_length
+                    ),
+                    "minimum_triangulation_angle_deg": (
+                        sparse_landmark_settings.minimum_triangulation_angle_deg
+                    ),
+                    "maximum_reprojection_error_px": (
+                        sparse_landmark_settings.maximum_reprojection_error_px
+                    ),
+                    "minimum_observations_after_validation": (
+                        sparse_landmark_settings.minimum_observations_after_validation
+                    ),
+                    "maximum_landmark_distance_percentile": (
+                        sparse_landmark_settings.maximum_landmark_distance_percentile
+                    ),
+                },
+                "scientific_note": (
+                    "Sparse landmarks come from multi-view feature geometry in the "
+                    "existing relative pose frame. They are not metric and are not "
+                    "automatically more accurate than the dense map."
+                ),
+            },
             "depth_quality_thresholds": {
                 "min_valid_depth_ratio": min_valid_depth_ratio,
                 "max_denominator_reject_ratio": max_denominator_reject_ratio,
@@ -1266,6 +1543,53 @@ def main() -> int:
             print(
                 "Experimental temporal-normalized map points: "
                 f"{result.temporal_normalized_fused_cloud.output_point_count}"
+            )
+        if result.sliding_window_pose_optimization_enabled:
+            optimization = result.sliding_window_pose_optimization_result
+            assert optimization is not None
+            print(
+                "Sliding-window pose optimization: "
+                f"accepted={optimization.accepted}, "
+                f"reason={optimization.reason}, "
+                f"frames={optimization.window_frame_indices}, "
+                f"edges={optimization.edges_used}, "
+                f"observations={optimization.total_observation_count}"
+            )
+            print(
+                "  Reprojection median/RMSE/p90 before="
+                f"{optimization.metrics_before.median}/"
+                f"{optimization.metrics_before.rmse}/"
+                f"{optimization.metrics_before.p90}, after="
+                f"{optimization.metrics_after.median}/"
+                f"{optimization.metrics_after.rmse}/"
+                f"{optimization.metrics_after.p90}"
+            )
+            for change in optimization.pose_changes:
+                print(
+                    f"  Frame {change.frame_index}: rotation change="
+                    f"{change.rotation_change_deg} deg, translation change="
+                    f"{change.translation_change} "
+                    f"(relative={change.translation_change_relative}), "
+                    f"center before={change.camera_center_before}, "
+                    f"center after={change.camera_center_after}"
+                )
+        if result.sparse_landmarks_enabled:
+            assert result.sparse_landmark_result is not None
+            sparse = result.sparse_landmark_result.diagnostics
+            print(
+                "Sparse landmarks: "
+                f"tracks={sparse['track_count']}, "
+                f"track lengths={sparse['track_length_distribution']}, "
+                f"final={sparse['final_landmark_count']}"
+            )
+            print(
+                "  Reprojection median/RMSE="
+                f"{sparse['reprojection_error_px']['median']}/"
+                f"{sparse['reprojection_error_px']['rmse']} px; "
+                "triangulation angle min/median/p90="
+                f"{sparse['triangulation_angle_deg']['min']}/"
+                f"{sparse['triangulation_angle_deg']['median']}/"
+                f"{sparse['triangulation_angle_deg']['p90']} deg"
             )
         print(f"Relative trajectory poses: {result.trajectory_positions.shape[0]}")
         for item in result.frame_statistics:
@@ -1373,6 +1697,28 @@ def main() -> int:
                 "not metres."
             )
         print(f"Final map: {ply_path.resolve()}")
+        if result.sparse_landmarks_enabled:
+            print(
+                "Sparse landmarks: "
+                f"{(run_directory / 'sparse_landmarks.ply').resolve()}"
+            )
+            print(
+                "Dense vs sparse overview: "
+                f"{(run_directory / 'dense_vs_sparse_overview.png').resolve()}"
+            )
+        if result.sliding_window_pose_optimization_enabled:
+            print(
+                "Pose baseline map: "
+                f"{(run_directory / 'global_relative_map_pose_baseline.ply').resolve()}"
+            )
+            print(
+                "Pose optimized map: "
+                f"{(run_directory / 'global_relative_map_pose_optimized.ply').resolve()}"
+            )
+            print(
+                "Sliding-window report: "
+                f"{(run_directory / 'sliding_window_optimization.json').resolve()}"
+            )
         if result.pair_alignment is not None:
             print(
                 "Pair alignment before: "
@@ -1412,6 +1758,23 @@ def main() -> int:
                 "Pose-chain diagnostic directory: "
                 f"{(run_directory / 'pose_chain_diagnostics').resolve()}"
             )
+        if result.transform_trace is not None:
+            print(
+                "Transform trace: "
+                f"{(run_directory / 'transform_trace.json').resolve()}"
+            )
+            for pair in result.transform_pair_consistency or ():
+                print(
+                    "  Transform consistency "
+                    f"{pair.previous_frame_index}->{pair.current_frame_index}: "
+                    f"count={pair.correspondence_count}, "
+                    f"local median/RMSE={pair.local_median_discrepancy}/"
+                    f"{pair.local_rmse_discrepancy}, "
+                    f"world median/RMSE={pair.world_median_discrepancy}/"
+                    f"{pair.world_rmse_discrepancy}, "
+                    "max residual-basis difference="
+                    f"{pair.maximum_local_world_residual_difference}"
+                )
         print(f"Outputs: {run_directory.resolve()}")
         return 0
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:

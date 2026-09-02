@@ -7,6 +7,8 @@ from src.visual_outputs import (
     display_cleaning_metadata,
     save_cloud_visual_artifacts,
     save_map_overview_panel,
+    save_pose_optimization_comparison,
+    save_pose_trajectory_comparison,
     save_rgb_depth_side_by_side,
     save_trajectory_previews,
 )
@@ -168,3 +170,35 @@ def test_visual_metadata_reports_raw_display_and_removed_counts() -> None:
         metadata["raw_point_count"] - metadata["display_point_count"]
     )
     assert metadata["coordinate_scale"] == "relative_non_metric"
+
+
+def test_pose_optimization_map_and_trajectory_artifacts_use_required_names(
+    tmp_path: Path,
+) -> None:
+    points, colors = synthetic_cloud(40)
+    optimized = points + [0.01, -0.02, 0.0]
+    baseline_trajectory = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])
+    optimized_trajectory = np.array([[0.0, 0.0, 0.0], [0.09, 0.01, 0.0]])
+
+    maps = save_pose_optimization_comparison(
+        tmp_path, points, colors, optimized, colors, preview_max_points=30
+    )
+    trajectories = save_pose_trajectory_comparison(
+        tmp_path, baseline_trajectory, optimized_trajectory
+    )
+
+    expected = {
+        "global_relative_map_pose_baseline.ply",
+        "global_relative_map_pose_optimized.ply",
+        "global_map_pose_baseline_front.png",
+        "global_map_pose_optimized_front.png",
+        "global_map_pose_baseline_oblique.png",
+        "global_map_pose_optimized_oblique.png",
+        "global_map_pose_baseline_top.png",
+        "global_map_pose_optimized_top.png",
+        "trajectory_pose_baseline.png",
+        "trajectory_pose_optimized.png",
+    }
+    paths = [*maps.values(), *trajectories.values()]
+    assert {path.name for path in paths} == expected
+    assert all(path.stat().st_size > 0 for path in paths)

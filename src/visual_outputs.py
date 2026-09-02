@@ -332,6 +332,89 @@ def save_temporal_depth_normalization_comparison(
     return paths
 
 
+def save_pose_optimization_comparison(
+    directory: str | Path,
+    baseline_points: np.ndarray,
+    baseline_colors: np.ndarray,
+    optimized_points: np.ndarray,
+    optimized_colors: np.ndarray,
+    *,
+    preview_max_points: int = 40_000,
+) -> dict[str, Path]:
+    """Save pose-only before/after maps with identical display treatment."""
+
+    output = Path(directory)
+    paths = {
+        "baseline_ply": output / "global_relative_map_pose_baseline.ply",
+        "optimized_ply": output / "global_relative_map_pose_optimized.ply",
+    }
+    write_ascii_ply(paths["baseline_ply"], baseline_points, baseline_colors)
+    write_ascii_ply(paths["optimized_ply"], optimized_points, optimized_colors)
+    for variant, points, colors in (
+        ("baseline", baseline_points, baseline_colors),
+        ("optimized", optimized_points, optimized_colors),
+    ):
+        title = f"Pose-{variant} relative map (non-metric)"
+        for view in ("front", "oblique", "top"):
+            key = f"{variant}_{view}"
+            paths[key] = output / f"global_map_pose_{variant}_{view}.png"
+            save_point_cloud_preview(
+                paths[key],
+                points,
+                colors,
+                view=view,
+                title=title,
+                max_points=preview_max_points,
+            )
+    return paths
+
+
+def save_pose_trajectory_comparison(
+    directory: str | Path,
+    baseline_trajectory: np.ndarray,
+    optimized_trajectory: np.ndarray,
+) -> dict[str, Path]:
+    """Save baseline and selected pose trajectories with shared 3D axes."""
+
+    output = Path(directory)
+    baseline = np.asarray(baseline_trajectory, dtype=np.float64)
+    optimized = np.asarray(optimized_trajectory, dtype=np.float64)
+    if (
+        baseline.ndim != 2
+        or baseline.shape[1:] != (3,)
+        or optimized.shape != baseline.shape
+        or not np.isfinite(baseline).all()
+        or not np.isfinite(optimized).all()
+    ):
+        raise ValueError("pose trajectories must be equal finite Nx3 arrays")
+    combined = np.vstack((baseline, optimized))
+    paths = {
+        "baseline_trajectory": output / "trajectory_pose_baseline.png",
+        "optimized_trajectory": output / "trajectory_pose_optimized.png",
+    }
+    for variant, trajectory in (
+        ("baseline", baseline),
+        ("optimized", optimized),
+    ):
+        figure = plt.figure(figsize=(8, 7), constrained_layout=True)
+        axis = figure.add_subplot(111, projection="3d")
+        axis.plot(
+            trajectory[:, 0], trajectory[:, 1], trajectory[:, 2],
+            "-o", markersize=4,
+        )
+        axis.set_xlabel("X (relative)")
+        axis.set_ylabel("Y (relative)")
+        axis.set_zlabel("Z (relative)")
+        axis.set_title(
+            f"{variant.capitalize()} camera trajectory (relative, non-metric)"
+        )
+        _set_equal_3d_axes(axis, combined)
+        axis.grid(True, alpha=0.3)
+        figure.savefig(paths[f"{variant}_trajectory"], dpi=150)
+        plt.close(figure)
+    return paths
+
+
 def save_cloud_visual_artifacts(
     directory: str | Path,
     points: np.ndarray,
